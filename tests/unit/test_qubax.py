@@ -368,7 +368,7 @@ def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_clien
     assert not items[fresh_id]["last_error"]
     assert items[old_id]["status"] == "failed"
     assert items[old_id]["last_error"] == qx.MISSING_GENERATION_TEXT
-    assert mock_client.get.call_count == 2
+    assert mock_client.get.call_count == 3
 
     second = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
     assert second.status_code == 200
@@ -377,7 +377,7 @@ def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_clien
     assert not again[fresh_id]["last_error"]
     assert again[old_id]["status"] == "failed"
     assert again[old_id]["last_error"] == qx.MISSING_GENERATION_TEXT
-    assert mock_client.get.call_count == 4
+    assert mock_client.get.call_count == 6
 
 
 @patch("app.api.routes.qubax._download_into_library", side_effect=RuntimeError("disk"))
@@ -504,3 +504,133 @@ def test_worker_fails_a_missing_generation_after_the_timeout():
             backend._await_result("key", "gone-1", lambda _progress: None)
     assert caught.value.retryable is False
     assert qx.MISSING_GENERATION_TEXT in str(caught.value)
+
+
+def test_qubax_activity_redacts_the_key_and_keeps_the_exchange():
+    from datetime import timedelta
+
+    from app.services.qubax_activity import clear_activity, recent_lines, record_exchange
+
+    clear_activity()
+    record_exchange(
+        "GET",
+        "/video/generations/stored-1",
+        400,
+        "Bearer secret-key-value Video generation not found.",
+        api_key="secret-key-value",
+    )
+    lines = recent_lines(timedelta(minutes=5))
+    assert len(lines) == 1
+    assert "secret-key-value" not in lines[0]
+    assert "Bearer …" in lines[0]
+    assert "GET /video/generations/stored-1 400" in lines[0]
+
+
+def test_match_listed_generation_picks_the_closest_free_prompt():
+    from datetime import datetime, timezone
+
+    items = [
+        {
+            "id": "early",
+            "model": "kling",
+            "prompt": "forest",
+            "created_at": "2026-11-22T18:00:00Z",
+            "status": "completed",
+        },
+        {
+            "id": "later",
+            "model": "kling",
+            "prompt": "forest",
+            "created_at": "2026-11-22T18:10:00Z",
+            "status": "completed",
+        },
+    ]
+    created = datetime(2026, 11, 22, 18, 9, tzinfo=timezone.utc)
+    closest = qx.match_listed_generation(
+        external_id="stored",
+        model="kling",
+        prompt="forest",
+        created_at=created,
+        items=items,
+        blocked_ids=set(),
+    )
+    assert closest is not None
+    assert closest["id"] == "later"
+    other = qx.match_listed_generation(
+        external_id="stored-2",
+        model="kling",
+        prompt="forest",
+        created_at=datetime(2026, 11, 22, 18, 1, tzinfo=timezone.utc),
+        items=items,
+        blocked_ids={"later"},
+    )
+    assert other is not None
+    assert other["id"] == "early"
+
+
+@patch("app.api.routes.qubax.probe_video")
+@patch("app.api.routes.qubax.download_url")
+@patch("app.services.qubax.http_client")
+def test_refresh_adopts_a_listed_video_when_the_stored_id_is_missing(
+    mock_client_factory, _download, mock_probe, auth_client, app_env
+):
+    from app.db.models import QubaxVideoJob
+    from app.services.media import Probe
+
+    db = app_env.SessionLocal()
+    row = QubaxVideoJob(
+        external_id="stored-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="forest at dawn",
+        status="failed",
+        last_error=qx.MISSING_GENERATION_TEXT,
+    )
+    db.add(row)
+    db.commit()
+    db.close()
+
+    mock_probe.return_value = Probe(duration_s=5, width=720, height=1280)
+
+    def get(url, *_args, **_kwargs):
+        response = MagicMock()
+        response.text = ""
+        if str(url).rstrip("/").endswith("/video/generations"):
+            response.status_code = 200
+            response.json.return_value = {
+                "data": [
+                    {
+                        "id": "real-9",
+                        "model": "kling-v3-standard-text-to-video",
+                        "prompt": "forest at dawn",
+                        "status": "completed",
+                        "video_url": "https://cdn.example/listed.mp4",
+                    }
+                ]
+            }
+        else:
+            response.status_code = 400
+            response.json.return_value = {
+                "error": {"message": "Video generation not found."}
+            }
+        return response
+
+    mock_client = MagicMock()
+    mock_client.get.side_effect = get
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client_factory.return_value = mock_client
+
+    response = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert response.status_code == 200
+    job = response.json()["items"][0]
+    assert job["status"] == "completed"
+    assert job["external_id"] == "real-9"
+    assert job["video_url"] == "https://cdn.example/listed.mp4"
+    assert job["media_filename"].endswith(".mp4")
+    assert not job["last_error"]
+
+    renders = auth_client.get("/api/generations", headers=_h())
+    qubax_rows = [item for item in renders.json() if item["backend"] == "qubax"]
+    assert len(qubax_rows) == 1
+    assert qubax_rows[0]["status"] == "done"
+    assert qubax_rows[0]["asset_filename"] == job["media_filename"]

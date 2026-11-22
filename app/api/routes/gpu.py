@@ -11,6 +11,7 @@ from app.api.deps import AuthDep, DocsOwnerDep
 from app.api.schemas import GpuLogsOut, GpuOut, GpuPresenceIn, GpuPresenceOut, LogTailOut
 from app.config import Settings, get_settings
 from app.services import salad_gpu, salad_idle
+from app.services.qubax_activity import recent_lines
 from app.services.gateway_probe import ollama_reachable, wan_async_capable, wan_reachable
 
 router = APIRouter(prefix="/api/gpu", tags=["gpu"])
@@ -154,10 +155,12 @@ _LOG_EMPTY = {
 
 
 def _hide_key(settings: Settings, text: str) -> str:
-    key = settings.salad_api_key.strip()
-    if len(key) >= 8 and key in text:
-        return text.replace(key, "…")
-    return text
+    cleaned = text
+    for key in (settings.salad_api_key, settings.qubax_api_key):
+        secret = key.strip()
+        if len(secret) >= 8 and secret in cleaned:
+            cleaned = cleaned.replace(secret, "…")
+    return cleaned
 
 
 def _tail(name: str, row: Mapping[str, object], settings: Settings) -> LogTailOut:
@@ -197,7 +200,14 @@ def read_gpu_logs(response: Response, since: str = Query(default="1h")) -> GpuLo
         since=_LOG_WINDOWS[window],
         empty_reason=_LOG_EMPTY[window],
     )
-    return GpuLogsOut(docker=docker, gpu=_tail("gpu", gpu, settings))
+    qubax_lines = [_hide_key(settings, line) for line in recent_lines(_LOG_WINDOWS[window])]
+    qubax = LogTailOut(
+        name="qubax",
+        available=True,
+        reason="" if qubax_lines else _LOG_EMPTY[window],
+        lines=qubax_lines,
+    )
+    return GpuLogsOut(docker=docker, gpu=_tail("gpu", gpu, settings), qubax=qubax)
 
 
 @router.get("", response_model=GpuOut, dependencies=[DocsOwnerDep])

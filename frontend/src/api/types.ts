@@ -834,6 +834,7 @@ export interface LogTailOut {
 export interface GpuLogsOut {
   docker: LogTailOut[];
   gpu: LogTailOut;
+  qubax?: LogTailOut;
 }
 
 export interface GpuOut {

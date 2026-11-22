@@ -12,7 +12,7 @@ import clsx from "clsx";
 import { useLocation, useNavigate } from "react-router-dom";
 
 import { api, formatApiError } from "../api/client";
-import type { AssistantJobOut, GpuLogsOut, GpuOut } from "../api/types";
+import type { AssistantJobOut, GpuLogsOut, GpuOut, LogTailOut } from "../api/types";
 import { GpuConnectBar } from "./GpuConnectBar";
 import { LazyInstagramBrowserPanel } from "./LazyInstagramBrowserPanel";
 import {
@@ -22,6 +22,7 @@ import {
   type AssistantMessageAttachment,
 } from "../api/assistant";
 import { mediaApiPath } from "../api/media";
+import { copyTextToClipboard } from "./DiagnosticLogPanel";
 import {
   generationFromStep,
   isTerminalGeneration,
@@ -516,6 +517,20 @@ function formatLogClock(when: Date): string {
   });
 }
 
+function tailBody(tail: LogTailOut | undefined): string {
+  if (!tail) return "логи недоступны";
+  if (!tail.available) return tail.reason || "логи недоступны";
+  if (tail.lines.length) return tail.lines.join("\n");
+  return tail.reason || "пусто";
+}
+
+export function formatAgentLogs(logs: GpuLogsOut): string {
+  const blocks = logs.docker.map((row) => `## Docker / ${row.name}\n${tailBody(row)}`);
+  blocks.push(`## Видеокарта\n${tailBody(logs.gpu)}`);
+  blocks.push(`## Qubax\n${tailBody(logs.qubax)}`);
+  return blocks.join("\n\n");
+}
+
 function LogTailPre({
   text,
   follow,
@@ -645,6 +660,12 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
 
   const openLogs = () => {
     setLogsOpen(true);
+  };
+
+  const copyLogs = async () => {
+    if (!logs) return;
+    const ok = await copyTextToClipboard(formatAgentLogs(logs));
+    toast(ok ? "Скопировано" : "Не удалось скопировать", ok ? "success" : "error");
   };
 
   const reloadGpu = useCallback(async () => {
@@ -2363,9 +2384,19 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
             title="Логи"
             widthClass="max-w-3xl"
             footer={
-              <button type="button" className="btn-ghost text-xs" onClick={() => void loadLogs(logsSince)} disabled={logsBusy}>
-                {logsBusy ? "Обновляю…" : "Обновить"}
-              </button>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="btn-ghost text-xs"
+                  onClick={() => void copyLogs()}
+                  disabled={!logs}
+                >
+                  Копировать
+                </button>
+                <button type="button" className="btn-ghost text-xs" onClick={() => void loadLogs(logsSince)} disabled={logsBusy}>
+                  {logsBusy ? "Обновляю…" : "Обновить"}
+                </button>
+              </div>
             }
           >
             <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-400">
@@ -2426,6 +2457,19 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
                     />
                   ) : (
                     <p className="mt-1 text-xs text-slate-400">{logs.gpu.reason || "логи недоступны"}</p>
+                  )}
+                </section>
+                <section>
+                  <h4 className="text-xs font-medium text-slate-300">Qubax</h4>
+                  {logs.qubax?.available !== false ? (
+                    <LogTailPre
+                      text={tailBody(logs.qubax)}
+                      follow={followTail}
+                      onLeaveTail={leaveTail}
+                      className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300"
+                    />
+                  ) : (
+                    <p className="mt-1 text-xs text-slate-400">{logs.qubax?.reason || "логи недоступны"}</p>
                   )}
                 </section>
               </div>

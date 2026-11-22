@@ -885,6 +885,7 @@ class LogTailOut(BaseModel):
 class GpuLogsOut(BaseModel):
     docker: list[LogTailOut]
     gpu: LogTailOut
+    qubax: LogTailOut
 
 
 class GpuOut(BaseModel):

@@ -27,31 +27,48 @@ import { usePollWhenVisible } from "../hooks/usePollWhenVisible";
 import { useToast } from "../context/ToastContext";
 import { EmptyState } from "./EmptyState";
 
-function QubaxJobPlayer({ job }: { job: QubaxJobOut }) {
+function QubaxJobPlayer({
+  job,
+  onPhase,
+}: {
+  job: QubaxJobOut;
+  onPhase?: (phase: "idle" | "loading" | "ready") => void;
+}) {
   const remote = job.video_url || "";
   const [src, setSrc] = useState(remote);
 
   useEffect(() => {
-    if (job.status !== "completed") return;
+    if (job.status !== "completed") {
+      onPhase?.("idle");
+      return;
+    }
     if (!job.media_filename) {
       setSrc(remote);
+      onPhase?.("idle");
       return;
     }
     let cancelled = false;
     let objectUrl = "";
+    onPhase?.("loading");
     fetchMediaObjectUrl(job.media_filename)
       .then((url) => {
         objectUrl = url;
-        if (!cancelled) setSrc(url);
+        if (!cancelled) {
+          setSrc(url);
+          onPhase?.("ready");
+        }
       })
       .catch(() => {
-        if (!cancelled) setSrc(remote);
+        if (!cancelled) {
+          setSrc(remote);
+          onPhase?.("ready");
+        }
       });
     return () => {
       cancelled = true;
       revokeMediaObjectUrl(objectUrl);
     };
-  }, [job.media_filename, job.status, remote]);
+  }, [job.media_filename, job.status, onPhase, remote]);
 
   if (job.status !== "completed" || !src) return null;
   return (
@@ -105,12 +122,33 @@ function chipPriceLabel(id: string, prices: Record<string, QubaxMarketModelOut>)
   return formatUnitPrice(row.price, row.unit ?? "job");
 }
 
-function jobStatusLabel(status: string): string {
+function jobStatusLabel(status: string, downloading: boolean): string {
+  if (downloading) return "Скачиваю…";
   const s = status.toLowerCase();
   if (s === "completed") return "Готово";
   if (s === "failed" || s === "error") return "Ошибка";
-  if (s === "processing" || s === "running") return "Рендер";
+  if (s === "processing" || s === "running" || s === "in_progress" || s === "rendering") return "Рендер";
   return "В очереди";
+}
+
+function formatElapsed(createdAt: string | null | undefined, now: number): string {
+  if (!createdAt) return "";
+  const start = Date.parse(createdAt);
+  if (!Number.isFinite(start)) return "";
+  const sec = Math.max(0, Math.floor((now - start) / 1000));
+  const minutes = Math.floor(sec / 60);
+  const seconds = sec % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function useNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [active]);
+  return now;
 }
 
 function isTerminal(status: string): boolean {
@@ -122,6 +160,88 @@ let variantKey = 0;
 function newVariant(model: string, duration: string, aspect: string): VariantRow {
   variantKey += 1;
   return { key: `v-${variantKey}`, model, duration, aspect_ratio: aspect };
+}
+
+function QubaxJobCard({
+  job,
+  fresh,
+  importBusy,
+  onImport,
+  onRepeat,
+}: {
+  job: QubaxJobOut;
+  fresh: boolean;
+  importBusy: boolean;
+  onImport: (id: number) => void;
+  onRepeat: (job: QubaxJobOut) => void;
+}) {
+  const [mediaPhase, setMediaPhase] = useState<"idle" | "loading" | "ready">("idle");
+  const onPhase = useCallback((phase: "idle" | "loading" | "ready") => {
+    setMediaPhase(phase);
+  }, []);
+  const live = !isTerminal(job.status);
+  const downloading = job.status === "completed" && Boolean(job.media_filename) && mediaPhase === "loading";
+  const ticking = live || downloading;
+  const now = useNow(ticking);
+  const elapsed = ticking ? formatElapsed(job.created_at, now) : "";
+  const label = jobStatusLabel(job.status, downloading);
+
+  return (
+    <li
+      className={clsx(
+        "flex flex-col rounded-lg bg-slate-900/60 p-3 text-sm transition-shadow",
+        fresh && "ring-2 ring-sky-400/80"
+      )}
+      data-testid={`qubax-job-${job.id}`}
+      data-fresh={fresh ? "true" : undefined}
+    >
+      <QubaxJobPlayer job={job} onPhase={onPhase} />
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="font-medium text-slate-200">{job.model}</span>
+        <span
+          className={clsx(
+            "inline-flex items-center gap-1 text-xs",
+            ticking
+              ? "text-amber-300"
+              : isTerminal(job.status) && job.status !== "completed"
+                ? "text-rose-400"
+                : "text-emerald-400"
+          )}
+          role="status"
+        >
+          {ticking ? <Loader2 className="animate-spin" size={12} /> : null}
+          {label}
+          {elapsed ? <span className="tabular-nums text-slate-400">{elapsed}</span> : null}
+        </span>
+      </div>
+      {ticking ? (
+        <div className="mt-2 h-1 overflow-hidden rounded-full bg-slate-800" data-testid="qubax-job-pulse" aria-hidden>
+          <div className="h-full w-1/3 animate-pulse rounded-full bg-sky-400" />
+        </div>
+      ) : null}
+      <p className="mt-1 line-clamp-2 text-xs text-slate-400">{job.prompt}</p>
+      {job.last_error && job.status !== "completed" ? (
+        <p className="mt-1 text-xs text-rose-400">{job.last_error}</p>
+      ) : null}
+      <div className="mt-2 flex flex-wrap gap-2">
+        {job.status === "completed" && !job.media_asset_id ? (
+          <button
+            type="button"
+            className="btn-secondary inline-flex items-center gap-1 text-xs"
+            disabled={importBusy}
+            aria-busy={importBusy}
+            onClick={() => onImport(job.id)}
+          >
+            {importBusy ? <Loader2 className="animate-spin" size={12} /> : null}
+            {importBusy ? "Сохраняю…" : "В библиотеку"}
+          </button>
+        ) : null}
+        <button type="button" className="btn-ghost text-xs" onClick={() => onRepeat(job)}>
+          Повторить
+        </button>
+      </div>
+    </li>
+  );
 }
 
 export function QubaxPanel() {
@@ -144,8 +264,11 @@ export function QubaxPanel() {
   const [variants, setVariants] = useState<VariantRow[]>([]);
   const [selectedPresets, setSelectedPresets] = useState<Set<string>>(new Set());
   const [jobs, setJobs] = useState<QubaxJobOut[]>([]);
-  const [submitBusy, setSubmitBusy] = useState(false);
+  const [submitKind, setSubmitKind] = useState<"single" | "batch" | null>(null);
   const [importBusy, setImportBusy] = useState<number | null>(null);
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [freshIds, setFreshIds] = useState<Set<number>>(new Set());
+  const freshTimer = useRef<number | null>(null);
   const [panelPublicUrl, setPanelPublicUrl] = useState("");
   const [defaultModel, setDefaultModel] = useState("kling-v3-standard-text-to-video");
   const [defaultModelI2v, setDefaultModelI2v] = useState("uncensored-i2v-pro");
@@ -157,6 +280,20 @@ export function QubaxPanel() {
   const [allowedAspects, setAllowedAspects] = useState<string[] | null>(null);
   const formHydrated = useRef(false);
   const skipAutosave = useRef(true);
+  const submitBusy = submitKind !== null;
+
+  const markFresh = useCallback((ids: number[]) => {
+    setFreshIds(new Set(ids));
+    if (freshTimer.current) window.clearTimeout(freshTimer.current);
+    freshTimer.current = window.setTimeout(() => setFreshIds(new Set()), 2500);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (freshTimer.current) window.clearTimeout(freshTimer.current);
+    },
+    []
+  );
 
   const applyLastForm = useCallback((lf: QubaxFormState | null | undefined) => {
     if (!lf) return;
@@ -346,7 +483,7 @@ export function QubaxPanel() {
     }
   }, [status?.configured]);
 
-  usePollWhenVisible(pollActive, 5000, Boolean(status?.configured && activeJobs.length));
+  usePollWhenVisible(pollActive, 2000, Boolean(status?.configured && activeJobs.length));
 
   useEffect(() => {
     if (!status?.configured || skipAutosave.current) return;
@@ -493,7 +630,7 @@ export function QubaxPanel() {
       return;
     }
     if (!(await warnIfInsufficient(singleEstimate))) return;
-    setSubmitBusy(true);
+    setSubmitKind("single");
     try {
       const job = await api.qubax.createJob({
         model,
@@ -503,11 +640,12 @@ export function QubaxPanel() {
         image_filename: mode === "i2v" ? imageFilename || null : null,
       });
       setJobs((prev) => [job, ...prev]);
+      markFresh([job.id]);
       push("Задача отправлена в Qubax", "success");
     } catch (err) {
       push(formatApiError(err), "error");
     } finally {
-      setSubmitBusy(false);
+      setSubmitKind(null);
     }
   };
 
@@ -533,7 +671,7 @@ export function QubaxPanel() {
       return;
     }
     if (!(await warnIfInsufficient(batchEstimate))) return;
-    setSubmitBusy(true);
+    setSubmitKind("batch");
     try {
       const out = await api.qubax.createBatch({
         prompt: prompt.trim(),
@@ -541,11 +679,21 @@ export function QubaxPanel() {
         image_filename: mode === "i2v" ? imageFilename || null : null,
       });
       setJobs((prev) => [...out.items, ...prev]);
+      markFresh(out.items.map((item) => item.id));
       push(`Запущено вариантов: ${out.total}`, "success");
     } catch (err) {
       push(formatApiError(err), "error");
     } finally {
-      setSubmitBusy(false);
+      setSubmitKind(null);
+    }
+  };
+
+  const refreshJobs = async () => {
+    setRefreshBusy(true);
+    try {
+      await loadJobs();
+    } finally {
+      setRefreshBusy(false);
     }
   };
 
@@ -900,9 +1048,15 @@ export function QubaxPanel() {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              <button type="button" className="btn-primary" disabled={submitBusy} onClick={() => void runSingle()}>
-                {submitBusy ? <Loader2 className="animate-spin" size={16} /> : <Wand2 size={16} />}
-                Сгенерировать
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={submitBusy}
+                aria-busy={submitKind === "single"}
+                onClick={() => void runSingle()}
+              >
+                {submitKind === "single" ? <Loader2 className="animate-spin" size={16} /> : <Wand2 size={16} />}
+                {submitKind === "single" ? "Отправляю…" : "Сгенерировать"}
               </button>
             </div>
           </section>
@@ -978,74 +1132,56 @@ export function QubaxPanel() {
             </div>
             <button
               type="button"
-              className="btn-secondary"
+              className="btn-secondary inline-flex items-center gap-1"
               data-testid="qubax-batch"
               disabled={submitBusy}
+              aria-busy={submitKind === "batch"}
               onClick={() => void runBatch()}
             >
-              Запустить варианты
+              {submitKind === "batch" ? <Loader2 className="animate-spin" size={16} /> : null}
+              {submitKind === "batch" ? "Запускаю…" : "Запустить варианты"}
             </button>
           </section>
 
           <section className="card space-y-3 p-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-medium">Задачи</h3>
-              <button type="button" className="btn-ghost text-xs" onClick={() => void loadJobs()}>
-                Обновить
+              <button
+                type="button"
+                className="btn-ghost text-xs"
+                data-testid="qubax-refresh-jobs"
+                disabled={refreshBusy}
+                aria-busy={refreshBusy}
+                onClick={() => void refreshJobs()}
+              >
+                {refreshBusy ? <Loader2 className="animate-spin" size={12} /> : <RefreshCw size={12} />}
+                {refreshBusy ? "Обновляю…" : "Обновить"}
               </button>
             </div>
+            {activeJobs.length ? (
+              <p className="text-xs text-amber-300" data-testid="qubax-active-count">
+                Сейчас в работе: {activeJobs.length}
+              </p>
+            ) : null}
             {!jobs.length ? (
               <p className="text-sm text-slate-500">Пока нет генераций.</p>
             ) : (
               <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 {jobs.map((job) => (
-                  <li key={job.id} className="flex flex-col rounded-lg bg-slate-900/60 p-3 text-sm" data-testid={`qubax-job-${job.id}`}>
-                    <QubaxJobPlayer job={job} />
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="font-medium text-slate-200">{job.model}</span>
-                      <span
-                        className={clsx(
-                          "text-xs",
-                          isTerminal(job.status) && job.status !== "completed"
-                            ? "text-rose-400"
-                            : job.status === "completed"
-                              ? "text-emerald-400"
-                              : "text-amber-300"
-                        )}
-                      >
-                        {jobStatusLabel(job.status)}
-                      </span>
-                    </div>
-                    <p className="mt-1 line-clamp-2 text-xs text-slate-400">{job.prompt}</p>
-                    {job.last_error && job.status !== "completed" ? (
-                      <p className="mt-1 text-xs text-rose-400">{job.last_error}</p>
-                    ) : null}
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {job.status === "completed" && !job.media_asset_id ? (
-                        <button
-                          type="button"
-                          className="btn-secondary text-xs"
-                          disabled={importBusy === job.id}
-                          onClick={() => void importJob(job.id)}
-                        >
-                          {importBusy === job.id ? "…" : "В библиотеку"}
-                        </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        className="btn-ghost text-xs"
-                        onClick={() => {
-                          setModel(job.model);
-                          setPrompt(job.prompt);
-                          const p = job.params || {};
-                          if (typeof p.duration === "string") setDuration(p.duration);
-                          if (typeof p.aspect_ratio === "string") setAspect(p.aspect_ratio);
-                        }}
-                      >
-                        Повторить
-                      </button>
-                    </div>
-                  </li>
+                  <QubaxJobCard
+                    key={job.id}
+                    job={job}
+                    fresh={freshIds.has(job.id)}
+                    importBusy={importBusy === job.id}
+                    onImport={(id) => void importJob(id)}
+                    onRepeat={(row) => {
+                      setModel(row.model);
+                      setPrompt(row.prompt);
+                      const p = row.params || {};
+                      if (typeof p.duration === "string") setDuration(p.duration);
+                      if (typeof p.aspect_ratio === "string") setAspect(p.aspect_ratio);
+                    }}
+                  />
                 ))}
               </ul>
             )}

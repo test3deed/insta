@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -10,6 +11,7 @@ import httpx
 from app.config import Settings, get_settings, settings
 from app.services.http import client as http_client
 from app.services.media_links import relative_url
+from app.services.qubax_activity import record_exchange
 
 QUBAX_TIMEOUT = 60.0
 MODELS_CACHE_TTL_S = 600.0
@@ -389,6 +391,157 @@ def estimate_jobs(
     return out, total_usd, jobs
 
 
+def _response_detail(response: httpx.Response, api_key: str) -> str:
+    text = response.text if isinstance(getattr(response, "text", None), str) else ""
+    if text.strip():
+        return text
+    try:
+        payload = response.json()
+    except Exception:
+        return ""
+    if isinstance(payload, (dict, list)):
+        return json.dumps(payload, ensure_ascii=False)
+    return ""
+
+
+def _logged_call(
+    api_key: str,
+    method: str,
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+) -> httpx.Response:
+    root = api_root()
+    url = f"{root}{path}"
+    try:
+        with http_client(settings, timeout=QUBAX_TIMEOUT, headers=_headers(api_key)) as client:
+            if method == "POST":
+                response = client.post(url, json=json_body)
+            else:
+                response = client.get(url)
+    except Exception as exc:
+        record_exchange(method, path, 0, _explain_http(exc), api_key=api_key)
+        raise
+    record_exchange(
+        method,
+        path,
+        int(getattr(response, "status_code", 0) or 0),
+        _response_detail(response, api_key),
+        api_key=api_key,
+    )
+    return response
+
+
+def generation_items(body: Any) -> list[dict[str, Any]]:
+    if isinstance(body, list):
+        return [item for item in body if isinstance(item, dict)]
+    if not isinstance(body, dict):
+        return []
+    for key in ("data", "items", "generations", "results"):
+        nested = body.get(key)
+        if isinstance(nested, list):
+            return [item for item in nested if isinstance(item, dict)]
+    if body.get("id") and (body.get("status") or body.get("prompt") or body.get("model")):
+        return [body]
+    return []
+
+
+def list_video_generations(api_key: str) -> list[dict[str, Any]]:
+    try:
+        response = _logged_call(api_key, "GET", "/video/generations")
+        _raise_http(response, context="list")
+        body = response.json()
+    except (QubaxError, json.JSONDecodeError, ValueError, TypeError):
+        return []
+    return generation_items(body)
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _item_created(item: dict[str, Any]) -> datetime | None:
+    for key in ("created_at", "created", "createdAt"):
+        parsed = _parse_time(item.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _same_prompt(left: str, right: str) -> bool:
+    a = " ".join((left or "").split())
+    b = " ".join((right or "").split())
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 40 and long.startswith(short[:120])
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def match_listed_generation(
+    *,
+    external_id: str,
+    model: str,
+    prompt: str,
+    created_at: datetime | None,
+    items: list[dict[str, Any]],
+    blocked_ids: set[str],
+) -> dict[str, Any] | None:
+    own = (external_id or "").strip()
+    for item in items:
+        item_id = str(item.get("id") or "").strip()
+        if item_id and item_id == own and item_id not in blocked_ids:
+            return item
+    wanted_model = (model or "").strip()
+    created = _as_utc(created_at)
+    candidates: list[dict[str, Any]] = []
+    for item in items:
+        item_id = str(item.get("id") or "").strip()
+        if item_id and item_id in blocked_ids:
+            continue
+        item_model = str(item.get("model") or "").strip()
+        if wanted_model and item_model and item_model != wanted_model:
+            continue
+        if not _same_prompt(prompt, str(item.get("prompt") or "")):
+            continue
+        candidates.append(item)
+    if not candidates:
+        return None
+    if created is None:
+        return candidates[0]
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            _item_created(item) is None,
+            abs(((_item_created(item) or created) - created).total_seconds()),
+        ),
+    )
+    return ranked[0]
+
+
 def create_video(
     api_key: str,
     *,
@@ -398,7 +551,6 @@ def create_video(
     aspect_ratio: str | None = None,
     image_url: str | None = None,
 ) -> dict[str, Any]:
-    root = api_root()
     payload: dict[str, Any] = {"model": model.strip(), "prompt": prompt.strip()}
     if duration:
         payload["duration"] = duration
@@ -406,10 +558,9 @@ def create_video(
         payload["aspect_ratio"] = aspect_ratio
     if image_url:
         payload["image_url"] = image_url
-    with http_client(settings, timeout=QUBAX_TIMEOUT, headers=_headers(api_key)) as client:
-        response = client.post(f"{root}/video/generations", json=payload)
-        _raise_http(response, context="submit")
-        body = response.json()
+    response = _logged_call(api_key, "POST", "/video/generations", json_body=payload)
+    _raise_http(response, context="submit")
+    body = response.json()
     if not isinstance(body, dict):
         raise QubaxError("Qubax вернул пустой ответ на submit")
     job_id = body.get("id")
@@ -420,12 +571,10 @@ def create_video(
 
 
 def get_video_job(api_key: str, external_id: str) -> dict[str, Any]:
-    root = api_root()
     safe = external_id.strip()
-    with http_client(settings, timeout=QUBAX_TIMEOUT, headers=_headers(api_key)) as client:
-        response = client.get(f"{root}/video/generations/{safe}")
-        _raise_http(response, context="status")
-        body = response.json()
+    response = _logged_call(api_key, "GET", f"/video/generations/{safe}")
+    _raise_http(response, context="status")
+    body = response.json()
     if not isinstance(body, dict):
         raise QubaxError("Qubax вернул некорректный статус")
     return body

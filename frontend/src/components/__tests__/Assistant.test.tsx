@@ -8,6 +8,7 @@ import { ConfirmProvider } from "../../context/ConfirmContext";
 import { ToastProvider } from "../../context/ToastContext";
 import { Assistant } from "../Assistant";
 import { ask } from "../../api/assistant";
+import * as logPanel from "../DiagnosticLogPanel";
 
 const useAuthMock = vi.hoisted(() => vi.fn());
 
@@ -141,6 +142,7 @@ beforeEach(() => {
   apiMock.gpu.logs.mockResolvedValue({
     docker: [{ name: "reels-api", available: true, reason: "", lines: ["api ok"] }],
     gpu: { name: "gpu", available: true, reason: "", lines: ["ollama"] },
+    qubax: { name: "qubax", available: true, reason: "", lines: ["GET /video/generations 200"] },
   });
   apiMock.llmGateway.credentials.mockReset();
   apiMock.llmGateway.credentials.mockResolvedValue({ ...gatewayFixture, recent: [] });
@@ -227,11 +229,32 @@ describe("Assistant", () => {
     expect(await screen.findByText("api ok")).toBeInTheDocument();
     expect(screen.getByText("ollama")).toBeInTheDocument();
     expect(screen.getByText("Видеокарта")).toBeInTheDocument();
+    expect(screen.getByText("Qubax")).toBeInTheDocument();
+    expect(screen.getByText("GET /video/generations 200")).toBeInTheDocument();
     expect(apiMock.gpu.logs).toHaveBeenCalledWith("1h");
     expect(screen.getByLabelText("Следить за хвостом")).toBeChecked();
     expect(screen.getByText(/Обновлено:/)).toBeInTheDocument();
     await user.selectOptions(screen.getByLabelText("Период логов"), "15m");
     await waitFor(() => expect(apiMock.gpu.logs).toHaveBeenCalledWith("15m"));
+  });
+
+  it("copies docker, gpu and qubax logs in one step", async () => {
+    const writeText = vi.spyOn(logPanel, "copyTextToClipboard").mockResolvedValue(true);
+    const user = userEvent.setup();
+    renderDock();
+    await user.click(await screen.findByRole("button", { name: "Логи" }));
+    expect(await screen.findByText("GET /video/generations 200")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Копировать" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    const text = String(writeText.mock.calls[0][0]);
+    expect(text).toContain("## Docker / reels-api");
+    expect(text).toContain("api ok");
+    expect(text).toContain("## Видеокарта");
+    expect(text).toContain("ollama");
+    expect(text).toContain("## Qubax");
+    expect(text).toContain("GET /video/generations 200");
+    expect(await screen.findByText("Скопировано")).toBeInTheDocument();
+    writeText.mockRestore();
   });
 
   it("keeps requesting logs while the window stays open", async () => {
