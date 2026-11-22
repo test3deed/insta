@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -129,6 +129,14 @@ def _apply_remote(row: QubaxVideoJob, body: dict[str, Any], *, now: datetime | N
         row.completed_at = row.completed_at or now
 
 
+def _job_is_fresh(row: QubaxVideoJob, *, now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    created = row.created_at or now
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return now - created < timedelta(seconds=30)
+
+
 def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
     if qx.is_terminal_status(row.status):
         return row
@@ -136,6 +144,8 @@ def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
         body = qx.get_video_job(key, row.external_id)
     except qx.QubaxError as exc:
         if qx.is_missing_generation(exc):
+            if _job_is_fresh(row):
+                return row
             row.status = "failed"
             row.last_error = qx.MISSING_GENERATION_TEXT
             row.completed_at = row.completed_at or datetime.now(timezone.utc)

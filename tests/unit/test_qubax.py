@@ -328,18 +328,29 @@ def _qubax_http(status_code: int, body: dict):
 
 @patch("app.services.qubax.http_client")
 def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_client, app_env):
+    from datetime import datetime, timedelta, timezone
+
     from app.db.models import QubaxVideoJob
 
     db = app_env.SessionLocal()
-    row = QubaxVideoJob(
-        external_id="gone-1",
+    fresh = QubaxVideoJob(
+        external_id="fresh-1",
         model="kling-v3-standard-text-to-video",
         prompt="forest",
         status="pending",
     )
-    db.add(row)
+    old = QubaxVideoJob(
+        external_id="gone-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="forest",
+        status="pending",
+        created_at=datetime.now(timezone.utc) - timedelta(seconds=31),
+    )
+    db.add(fresh)
+    db.add(old)
     db.commit()
-    job_id = row.id
+    fresh_id = fresh.id
+    old_id = old.id
     db.close()
 
     mock_client = _qubax_http(
@@ -350,16 +361,19 @@ def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_clien
 
     first = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
     assert first.status_code == 200
-    item = next(job for job in first.json()["items"] if job["id"] == job_id)
-    assert item["status"] == "failed"
-    assert item["last_error"] == qx.MISSING_GENERATION_TEXT
-    assert mock_client.get.call_count == 1
+    items = {job["id"]: job for job in first.json()["items"]}
+    assert items[fresh_id]["status"] == "pending"
+    assert not items[fresh_id]["last_error"]
+    assert items[old_id]["status"] == "failed"
+    assert items[old_id]["last_error"] == qx.MISSING_GENERATION_TEXT
+    assert mock_client.get.call_count == 2
 
     second = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
     assert second.status_code == 200
-    again = next(job for job in second.json()["items"] if job["id"] == job_id)
-    assert again["status"] == "failed"
-    assert mock_client.get.call_count == 1
+    again = {job["id"]: job for job in second.json()["items"]}
+    assert again[fresh_id]["status"] == "pending"
+    assert again[old_id]["status"] == "failed"
+    assert mock_client.get.call_count == 3
 
 
 def test_worker_does_not_retry_a_missing_generation():
