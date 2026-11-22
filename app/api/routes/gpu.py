@@ -11,6 +11,7 @@ from app.api.deps import AuthDep, DocsOwnerDep
 from app.api.schemas import GpuLogsOut, GpuOut, GpuPresenceIn, GpuPresenceOut, LogTailOut
 from app.config import Settings, get_settings
 from app.services import salad_gpu, salad_idle
+from app.services.browser_activity import recent_lines as browser_recent_lines
 from app.services.qubax_activity import recent_lines
 from app.services.gateway_probe import ollama_reachable, wan_async_capable, wan_reachable
 
@@ -207,7 +208,19 @@ def read_gpu_logs(response: Response, since: str = Query(default="1h")) -> GpuLo
         reason="" if qubax_lines else _LOG_EMPTY[window],
         lines=qubax_lines,
     )
-    return GpuLogsOut(docker=docker, gpu=_tail("gpu", gpu, settings), qubax=qubax)
+    browser_lines = [_hide_key(settings, line) for line in browser_recent_lines(_LOG_WINDOWS[window])]
+    browser = LogTailOut(
+        name="browser",
+        available=True,
+        reason="" if browser_lines else _LOG_EMPTY[window],
+        lines=browser_lines,
+    )
+    return GpuLogsOut(
+        docker=docker,
+        gpu=_tail("gpu", gpu, settings),
+        qubax=qubax,
+        browser=browser,
+    )
 
 
 @router.get("", response_model=GpuOut, dependencies=[DocsOwnerDep])

@@ -46,6 +46,38 @@ async def test_status_dict_includes_action_logs():
     assert data["logs"]
     assert data["logs"][0]["message"] == "hello"
     assert data["logs"][0]["step"] == "start"
+    from datetime import timedelta
+
+    from app.services.browser_activity import clear_activity, recent_lines
+
+    clear_activity()
+    session.log("info", "goto", "Открываю https://example.com/login")
+    lines = recent_lines(timedelta(minutes=5))
+    assert lines[-1].endswith("alice goto Открываю https://example.com/login")
+
+
+@pytest.mark.asyncio
+async def test_vnc_click_is_logged_without_an_agent_job(monkeypatch):
+    from datetime import timedelta
+
+    from app.browser.session_manager import BrowserSessionState, _record_vnc_click
+    from app.services.browser_activity import clear_activity, recent_lines
+
+    clear_activity()
+    session = BrowserSessionState(username="alice")
+    _record_vnc_click(session, {"label": "Войти", "url": "https://instagram.com/accounts/login"})
+    lines = recent_lines(timedelta(minutes=5))
+    assert any("alice click клик «Войти» на https://instagram.com/accounts/login" in line for line in lines)
+    assert session.action_logs[-1]["step"] == "click"
+
+    notes: list[tuple] = []
+    monkeypatch.setattr(
+        "app.assistant.run_log.append_for",
+        lambda job_id, kind, text: notes.append((job_id, kind, text)),
+    )
+    session.run_job_id = 7
+    _record_vnc_click(session, {"label": "Войти", "url": "https://instagram.com"})
+    assert notes == [(7, "browser", "клик «Войти» на https://instagram.com")]
 
 
 @pytest.mark.asyncio

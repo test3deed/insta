@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -430,116 +429,6 @@ def _logged_call(
         api_key=api_key,
     )
     return response
-
-
-def generation_items(body: Any) -> list[dict[str, Any]]:
-    if isinstance(body, list):
-        return [item for item in body if isinstance(item, dict)]
-    if not isinstance(body, dict):
-        return []
-    for key in ("data", "items", "generations", "results"):
-        nested = body.get(key)
-        if isinstance(nested, list):
-            return [item for item in nested if isinstance(item, dict)]
-    if body.get("id") and (body.get("status") or body.get("prompt") or body.get("model")):
-        return [body]
-    return []
-
-
-def list_video_generations(api_key: str) -> list[dict[str, Any]]:
-    try:
-        response = _logged_call(api_key, "GET", "/video/generations")
-        _raise_http(response, context="list")
-        body = response.json()
-    except (QubaxError, json.JSONDecodeError, ValueError, TypeError):
-        return []
-    return generation_items(body)
-
-
-def _parse_time(value: Any) -> datetime | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _item_created(item: dict[str, Any]) -> datetime | None:
-    for key in ("created_at", "created", "createdAt"):
-        parsed = _parse_time(item.get(key))
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _same_prompt(left: str, right: str) -> bool:
-    a = " ".join((left or "").split())
-    b = " ".join((right or "").split())
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    short, long = (a, b) if len(a) <= len(b) else (b, a)
-    return len(short) >= 40 and long.startswith(short[:120])
-
-
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-def match_listed_generation(
-    *,
-    external_id: str,
-    model: str,
-    prompt: str,
-    created_at: datetime | None,
-    items: list[dict[str, Any]],
-    blocked_ids: set[str],
-) -> dict[str, Any] | None:
-    own = (external_id or "").strip()
-    for item in items:
-        item_id = str(item.get("id") or "").strip()
-        if item_id and item_id == own and item_id not in blocked_ids:
-            return item
-    wanted_model = (model or "").strip()
-    created = _as_utc(created_at)
-    candidates: list[dict[str, Any]] = []
-    for item in items:
-        item_id = str(item.get("id") or "").strip()
-        if item_id and item_id in blocked_ids:
-            continue
-        item_model = str(item.get("model") or "").strip()
-        if wanted_model and item_model and item_model != wanted_model:
-            continue
-        if not _same_prompt(prompt, str(item.get("prompt") or "")):
-            continue
-        candidates.append(item)
-    if not candidates:
-        return None
-    if created is None:
-        return candidates[0]
-    ranked = sorted(
-        candidates,
-        key=lambda item: (
-            _item_created(item) is None,
-            abs(((_item_created(item) or created) - created).total_seconds()),
-        ),
-    )
-    return ranked[0]
 
 
 def create_video(

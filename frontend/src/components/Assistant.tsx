@@ -528,6 +528,7 @@ export function formatAgentLogs(logs: GpuLogsOut): string {
   const blocks = logs.docker.map((row) => `## Docker / ${row.name}\n${tailBody(row)}`);
   blocks.push(`## Видеокарта\n${tailBody(logs.gpu)}`);
   blocks.push(`## Qubax\n${tailBody(logs.qubax)}`);
+  blocks.push(`## Браузер\n${tailBody(logs.browser)}`);
   return blocks.join("\n\n");
 }
 
@@ -2470,6 +2471,19 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
                     />
                   ) : (
                     <p className="mt-1 text-xs text-slate-400">{logs.qubax?.reason || "логи недоступны"}</p>
+                  )}
+                </section>
+                <section>
+                  <h4 className="text-xs font-medium text-slate-300">Браузер</h4>
+                  {logs.browser?.available !== false ? (
+                    <LogTailPre
+                      text={tailBody(logs.browser)}
+                      follow={followTail}
+                      onLeaveTail={leaveTail}
+                      className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-slate-950 p-3 font-mono text-[11px] leading-relaxed text-slate-300"
+                    />
+                  ) : (
+                    <p className="mt-1 text-xs text-slate-400">{logs.browser?.reason || "логи недоступны"}</p>
                   )}
                 </section>
               </div>

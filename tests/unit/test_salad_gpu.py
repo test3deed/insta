@@ -449,7 +449,11 @@ def test_salad_403_returns_probes_without_echoing_key(auth_client, monkeypatch):
 
 
 def test_gpu_logs_include_docker_and_salad_without_the_key(auth_client, monkeypatch):
+    from app.services.browser_activity import clear_activity, record_action
+
     _configure(monkeypatch)
+    clear_activity()
+    record_action("alice", "click", "клик «Войти» на https://example.com")
     monkeypatch.setattr(
         "app.assistant.tools.docker_logs",
         lambda service, tail=200, since="1h": {
@@ -476,6 +480,8 @@ def test_gpu_logs_include_docker_and_salad_without_the_key(auth_client, monkeypa
     assert body["docker"][0]["lines"] == ["reels-api ok"]
     assert body["gpu"]["available"] is True
     assert body["gpu"]["lines"] == ["leak …", "ollama ready"]
+    assert body["browser"]["available"] is True
+    assert any("alice click клик «Войти»" in line for line in body["browser"]["lines"])
     assert SECRET not in res.text
     sent = json.loads(route.calls[0].request.read().decode())
     assert 'resource.type = "container"' in sent["query"]

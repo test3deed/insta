@@ -139,18 +139,18 @@ def _apply_remote(row: QubaxVideoJob, body: dict[str, Any], *, now: datetime | N
         row.completed_at = row.completed_at or now
 
 
-def _within_generation_window(row: QubaxVideoJob, *, now: datetime | None = None) -> bool:
+MISSING_GRACE_S = 60
+
+
+def _within_missing_grace(row: QubaxVideoJob, *, now: datetime | None = None) -> bool:
     now = now or datetime.now(timezone.utc)
     created = row.created_at or now
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    limit = timedelta(seconds=float(settings.generation_timeout_seconds))
-    return now - created < limit
+    return now - created < timedelta(seconds=MISSING_GRACE_S)
 
 
 def _needs_remote_refresh(row: QubaxVideoJob) -> bool:
-    if row.last_error == qx.MISSING_GENERATION_TEXT:
-        return True
     return not qx.is_terminal_status(row.status)
 
 
@@ -221,71 +221,14 @@ def _persist_completed(db: Session, row: QubaxVideoJob) -> QubaxVideoJob:
     return row
 
 
-def _blocked_ids(db: Session, row: QubaxVideoJob, claimed: set[str]) -> set[str]:
-    others = db.scalars(
-        select(QubaxVideoJob.external_id).where(QubaxVideoJob.id != row.id)
-    ).all()
-    blocked = {str(item) for item in others if item}
-    blocked.update(claimed)
-    own = (row.external_id or "").strip()
-    if own:
-        blocked.discard(own)
-    return blocked
-
-
-def _catalog_items(key: str, catalog: dict[str, Any]) -> list[dict[str, Any]]:
-    if catalog.get("fetched"):
-        items = catalog.get("items")
-        return items if isinstance(items, list) else []
-    catalog["fetched"] = True
-    items = qx.list_video_generations(key)
-    catalog["items"] = items
-    return items
-
-
-def _adopt_listed(db: Session, row: QubaxVideoJob, key: str, catalog: dict[str, Any]) -> bool:
-    claimed = catalog.setdefault("claimed", set())
-    if not isinstance(claimed, set):
-        claimed = set()
-        catalog["claimed"] = claimed
-    match = qx.match_listed_generation(
-        external_id=row.external_id,
-        model=row.model,
-        prompt=row.prompt,
-        created_at=row.created_at,
-        items=_catalog_items(key, catalog),
-        blocked_ids=_blocked_ids(db, row, claimed),
-    )
-    if match is None:
-        return False
-    new_id = str(match.get("id") or "").strip()
-    if new_id:
-        claimed.add(new_id)
-        row.external_id = new_id
-    _apply_remote(row, match)
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    _persist_completed(db, row)
-    return True
-
-
-def _refresh_job(
-    db: Session,
-    row: QubaxVideoJob,
-    key: str,
-    catalog: dict[str, Any] | None = None,
-) -> QubaxVideoJob:
+def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
     if not _needs_remote_refresh(row):
         return _persist_completed(db, row)
-    catalog = catalog if catalog is not None else {}
     try:
         body = qx.get_video_job(key, row.external_id)
     except qx.QubaxError as exc:
         if qx.is_missing_generation(exc):
-            if _adopt_listed(db, row, key, catalog):
-                return row
-            if _within_generation_window(row):
+            if _within_missing_grace(row):
                 if row.status != "pending" or row.last_error or row.completed_at is not None:
                     row.status = "pending"
                     row.last_error = None
@@ -615,10 +558,9 @@ def list_jobs(
     if sync_active and rows:
         key = resolve_qubax_api_key(db)
         if key:
-            catalog: dict[str, Any] = {}
             for row in rows:
                 if _needs_remote_refresh(row) or row.status == "completed":
-                    _refresh_job(db, row, key, catalog)
+                    _refresh_job(db, row, key)
     return QubaxJobListOut(items=[_job_out(db, r) for r in rows], total=total)
 
 

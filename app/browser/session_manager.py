@@ -702,23 +702,34 @@ class BrowserSessionState:
             del self.action_logs[: len(self.action_logs) - _MAX_ACTION_LOGS]
         log_fn = logger.info if level == "info" else logger.warning if level == "warn" else logger.error
         log_fn("browser_session.action", username=self.username, step=step, level=level, message=message)
+        from app.services.browser_activity import record_action
+
+        record_action(self.username, step, message)
+
+
+def _record_vnc_click(session: BrowserSessionState, payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+    label = str(payload.get("label") or "элемент").strip()[:120] or "элемент"
+    url = str(payload.get("url") or "").strip()[:300]
+    line = f"клик «{label}» на {url}".strip()
+    session.log("info", "click", line)
+    job_id = session.run_job_id
+    if job_id is None:
+        return
+    from app.assistant.run_log import append_for
+
+    append_for(job_id, "browser", line)
 
 
 async def _arm_run_clicks(session: BrowserSessionState) -> None:
-    """Record clicks on the in-app browser while an assistant run owns the session."""
+    """Record clicks inside the noVNC Chrome window for every Playwright session."""
     if session.run_clicks_armed or session.context is None:
         return
     session.run_clicks_armed = True
 
     async def _on_click(_source: Any, payload: Any) -> None:
-        job_id = session.run_job_id
-        if job_id is None or not isinstance(payload, dict):
-            return
-        from app.assistant.run_log import append_for
-
-        label = str(payload.get("label") or "элемент").strip()[:120] or "элемент"
-        url = str(payload.get("url") or "").strip()[:300]
-        append_for(job_id, "browser", f"клик «{label}» на {url}".strip())
+        _record_vnc_click(session, payload)
 
     try:
         await session.context.expose_binding("agentRunClick", _on_click)
@@ -727,9 +738,12 @@ async def _arm_run_clicks(session: BrowserSessionState) -> None:
             document.addEventListener("click", (event) => {
               const el = event.target;
               if (!el || typeof agentRunClick !== "function") return;
+              const type = (el.getAttribute && (el.getAttribute("type") || "")).toLowerCase();
+              if (type === "password") return;
+              const tag = el.tagName || "";
               const label = (el.getAttribute && (el.getAttribute("aria-label") || ""))
-                || (el.innerText || "")
-                || (el.tagName || "");
+                || (tag === "INPUT" || tag === "TEXTAREA" ? tag : (el.innerText || ""))
+                || tag;
               agentRunClick({
                 label: String(label).replace(/\\s+/g, " ").trim().slice(0, 120),
                 url: location.href

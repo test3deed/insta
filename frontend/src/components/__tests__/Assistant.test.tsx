@@ -143,6 +143,7 @@ beforeEach(() => {
     docker: [{ name: "reels-api", available: true, reason: "", lines: ["api ok"] }],
     gpu: { name: "gpu", available: true, reason: "", lines: ["ollama"] },
     qubax: { name: "qubax", available: true, reason: "", lines: ["GET /video/generations 200"] },
+    browser: { name: "browser", available: true, reason: "", lines: ["alice click клик «Войти»"] },
   });
   apiMock.llmGateway.credentials.mockReset();
   apiMock.llmGateway.credentials.mockResolvedValue({ ...gatewayFixture, recent: [] });
@@ -231,6 +232,8 @@ describe("Assistant", () => {
     expect(screen.getByText("Видеокарта")).toBeInTheDocument();
     expect(screen.getByText("Qubax")).toBeInTheDocument();
     expect(screen.getByText("GET /video/generations 200")).toBeInTheDocument();
+    expect(screen.getByText("Браузер")).toBeInTheDocument();
+    expect(screen.getByText("alice click клик «Войти»")).toBeInTheDocument();
     expect(apiMock.gpu.logs).toHaveBeenCalledWith("1h");
     expect(screen.getByLabelText("Следить за хвостом")).toBeChecked();
     expect(screen.getByText(/Обновлено:/)).toBeInTheDocument();
@@ -253,6 +256,8 @@ describe("Assistant", () => {
     expect(text).toContain("ollama");
     expect(text).toContain("## Qubax");
     expect(text).toContain("GET /video/generations 200");
+    expect(text).toContain("## Браузер");
+    expect(text).toContain("alice click клик «Войти»");
     expect(await screen.findByText("Скопировано")).toBeInTheDocument();
     writeText.mockRestore();
   });

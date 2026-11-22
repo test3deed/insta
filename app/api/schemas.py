@@ -886,6 +886,7 @@ class GpuLogsOut(BaseModel):
     docker: list[LogTailOut]
     gpu: LogTailOut
     qubax: LogTailOut
+    browser: LogTailOut
 
 
 class GpuOut(BaseModel):
