@@ -154,10 +154,13 @@ class QubaxVideoBackend(VideoBackend):
             try:
                 body = qx.get_video_job(api_key, external_id)
             except qx.QubaxError as exc:
-                raise GenerationError(
-                    str(exc),
-                    retryable=not qx.is_missing_generation(exc),
-                ) from exc
+                if qx.is_missing_generation(exc) and time.monotonic() < deadline:
+                    report(Progress(STAGE_RENDERING))
+                    time.sleep(interval)
+                    continue
+                if qx.is_missing_generation(exc):
+                    raise GenerationError(qx.MISSING_GENERATION_TEXT, retryable=False) from exc
+                raise GenerationError(str(exc), retryable=exc.status_code == 504) from exc
             status = str(body.get("status") or "").lower()
             if not is_terminal_status(status):
                 report(Progress(STAGE_RENDERING))

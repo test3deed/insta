@@ -48,6 +48,7 @@ const apiMock = vi.hoisted(() => ({
     cancelComposition: vi.fn(),
     retryComposition: vi.fn(),
   },
+  qubax: { status: vi.fn() },
 }));
 
 vi.mock("../../api/client", async () => {
@@ -75,6 +76,7 @@ function defaults() {
   apiMock.factory.retryGeneration.mockResolvedValue({ id: 11 });
   apiMock.factory.createComposition.mockResolvedValue({ id: 3 });
   apiMock.factory.assets.mockResolvedValue([]);
+  apiMock.qubax.status.mockResolvedValue({ configured: false, key_from_env: false });
   apiMock.factory.cancelComposition.mockResolvedValue({ id: 4 });
   apiMock.factory.retryComposition.mockResolvedValue({ id: 4 });
 }
@@ -101,6 +103,7 @@ describe("Renders page", () => {
     Object.values(apiMock.accounts).forEach((fn) => fn.mockReset());
     Object.values(apiMock.videos).forEach((fn) => fn.mockReset());
     Object.values(apiMock.factory).forEach((fn) => fn.mockReset());
+    Object.values(apiMock.qubax).forEach((fn) => fn.mockReset());
     defaults();
   });
 

@@ -322,6 +322,7 @@ export interface QubaxJobOut {
   video_url?: string | null;
   last_error?: string | null;
   media_asset_id?: number | null;
+  media_filename?: string | null;
   params?: Record<string, unknown>;
   created_at?: string | null;
   completed_at?: string | null;

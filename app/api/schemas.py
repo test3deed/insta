@@ -840,6 +840,7 @@ class QubaxJobOut(BaseModel):
     video_url: Optional[str] = None
     last_error: Optional[str] = None
     media_asset_id: Optional[int] = None
+    media_filename: Optional[str] = None
     params: dict[str, object] = Field(default_factory=dict)
     created_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None

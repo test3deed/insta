@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useSearchParams } from "react-router-dom";
 
 import { api, formatApiError } from "../api/client";
+import { fetchMediaObjectUrl, revokeMediaObjectUrl } from "../api/media";
 import { Card } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
 import { PageHeader } from "../components/PageHeader";
@@ -55,7 +56,37 @@ type Gen = {
   backend?: string;
   queue_position?: number | null;
   offer_local_switch?: boolean;
+  asset_filename?: string | null;
 };
+
+function RenderClip({ filename }: { filename: string }) {
+  const [src, setSrc] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = "";
+    fetchMediaObjectUrl(filename)
+      .then((url) => {
+        objectUrl = url;
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(null);
+      });
+    return () => {
+      cancelled = true;
+      revokeMediaObjectUrl(objectUrl);
+    };
+  }, [filename]);
+  if (!src) return null;
+  return (
+    <video
+      src={src}
+      controls
+      playsInline
+      className="mt-2 max-h-40 w-full max-w-[10rem] rounded bg-black"
+    />
+  );
+}
 const LOCAL_OFFER_DISMISS_KEY = "renders:local-offer-dismissed";
 type Join = { id: number; status: string; post_title: string; last_error: string | null; clips: number };
 
@@ -873,8 +904,9 @@ export function Renders() {
                   <StatusBadge value={g.status} />
                 </td>
                 <td className="hidden md:table-cell">{g.backend || "—"}</td>
-                <td className="truncate" title={g.post_title || g.prompt}>
-                  {g.post_title || g.prompt.slice(0, 60)}
+                <td title={g.post_title || g.prompt}>
+                  <p className="truncate">{g.post_title || g.prompt.slice(0, 60)}</p>
+                  {g.asset_filename ? <RenderClip filename={g.asset_filename} /> : null}
                 </td>
                 <td className="min-w-[7rem] md:min-w-[8rem]">
                   <p className="truncate text-xs text-slate-300" title={generationStageLabel(g.status, g.stage, g.queue_position)}>

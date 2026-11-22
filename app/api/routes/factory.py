@@ -58,7 +58,7 @@ def _generation_http_detail(detail: str, backend: str) -> str:
     return enrich_generation_error(detail, backend=backend)
 
 
-def _generation_row(job: GenerationJob) -> dict[str, Any]:
+def _generation_row(job: GenerationJob, asset_filename: str | None = None) -> dict[str, Any]:
     return {
         "id": job.id,
         "status": job.status.value,
@@ -70,9 +70,18 @@ def _generation_row(job: GenerationJob) -> dict[str, Any]:
         "cost_usd": job.cost_usd,
         "backend": job.backend,
         "asset_id": job.asset_id,
+        "asset_filename": asset_filename,
         "offer_local_switch": should_offer_local_switch(job, settings),
         "poll_timeout_ms": settings.poll_timeout_ms(),
     }
+
+
+def _asset_filenames(db: Session, jobs: list[GenerationJob]) -> dict[int, str]:
+    ids = [job.asset_id for job in jobs if job.asset_id]
+    if not ids:
+        return {}
+    assets = db.scalars(select(MediaAsset).where(MediaAsset.id.in_(ids))).all()
+    return {asset.id: asset.filename for asset in assets}
 
 
 router = APIRouter(tags=["factory"], dependencies=[AuthDep])
@@ -673,7 +682,8 @@ def get_generation(job_id: int, db: Session = Depends(get_db)) -> dict[str, Any]
     job = db.get(GenerationJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Рендер не найден")
-    return _generation_row(job)
+    names = _asset_filenames(db, [job])
+    return _generation_row(job, names.get(job.asset_id) if job.asset_id else None)
 
 
 @router.get("/api/generations")
@@ -685,8 +695,9 @@ def list_generations(
     stmt = select(GenerationJob).order_by(GenerationJob.created_at.desc()).limit(limit)
     if status_filter:
         stmt = stmt.where(GenerationJob.status == PipelineStatus(status_filter))
-    rows = db.scalars(stmt).all()
-    return [_generation_row(r) for r in rows]
+    rows = list(db.scalars(stmt).all())
+    names = _asset_filenames(db, rows)
+    return [_generation_row(r, names.get(r.asset_id) if r.asset_id else None) for r in rows]
 
 
 @router.get("/api/compositions")

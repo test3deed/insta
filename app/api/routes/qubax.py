@@ -30,7 +30,7 @@ from app.api.schemas import (
     QubaxStatusOut,
 )
 from app.config import settings
-from app.db.models import AssetKind, AssetSource, MediaAsset, QubaxVideoJob
+from app.db.models import AssetKind, AssetSource, GenerationJob, MediaAsset, PipelineStatus, QubaxVideoJob
 from app.generation.download import download_url
 from app.panel.settings_store import (
     get_qubax_last_form,
@@ -83,7 +83,16 @@ def _params_dict(raw: str | None) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
-def _job_out(row: QubaxVideoJob) -> QubaxJobOut:
+def _media_filename(db: Session, row: QubaxVideoJob) -> str | None:
+    if row.media_asset_id is None:
+        return None
+    asset = db.get(MediaAsset, row.media_asset_id)
+    if asset is None:
+        return None
+    return asset.filename
+
+
+def _job_out(db: Session, row: QubaxVideoJob) -> QubaxJobOut:
     return QubaxJobOut(
         id=row.id,
         external_id=row.external_id,
@@ -93,6 +102,7 @@ def _job_out(row: QubaxVideoJob) -> QubaxJobOut:
         video_url=row.video_url,
         last_error=row.last_error,
         media_asset_id=row.media_asset_id,
+        media_filename=_media_filename(db, row),
         params=_params_dict(row.params_json),
         created_at=row.created_at,
         completed_at=row.completed_at,
@@ -129,22 +139,103 @@ def _apply_remote(row: QubaxVideoJob, body: dict[str, Any], *, now: datetime | N
         row.completed_at = row.completed_at or now
 
 
-def _job_is_fresh(row: QubaxVideoJob, *, now: datetime | None = None) -> bool:
+def _within_generation_window(row: QubaxVideoJob, *, now: datetime | None = None) -> bool:
     now = now or datetime.now(timezone.utc)
     created = row.created_at or now
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    return now - created < timedelta(seconds=30)
+    limit = timedelta(seconds=float(settings.generation_timeout_seconds))
+    return now - created < limit
+
+
+def _needs_remote_refresh(row: QubaxVideoJob) -> bool:
+    if row.last_error == qx.MISSING_GENERATION_TEXT:
+        return True
+    return not qx.is_terminal_status(row.status)
+
+
+def _download_into_library(db: Session, row: QubaxVideoJob) -> MediaAsset:
+    if row.media_asset_id is not None:
+        existing = db.get(MediaAsset, row.media_asset_id)
+        if existing is not None:
+            return existing
+    if not row.video_url:
+        raise qx.QubaxError("Qubax не вернул video_url")
+    final_name = f"{uuid.uuid4().hex}.mp4"
+    dest = settings.media_dir / final_name
+    settings.media_dir.mkdir(parents=True, exist_ok=True)
+    with http_client(settings, timeout=300) as client:
+        download_url(client, row.video_url, dest, name="qubax")
+    probe = probe_video(dest)
+    params = _params_dict(row.params_json)
+    asset = MediaAsset(
+        filename=final_name,
+        kind=AssetKind.video,
+        source=AssetSource.generated,
+        label=str(params.get("batch_label") or f"qubax:{row.model}")[:120],
+        generator=row.model,
+        prompt=row.prompt,
+        duration_s=probe.duration_s,
+        width=probe.width,
+        height=probe.height,
+    )
+    db.add(asset)
+    db.flush()
+    row.media_asset_id = asset.id
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    db.refresh(asset)
+    return asset
+
+
+def _ensure_render(db: Session, row: QubaxVideoJob, asset: MediaAsset) -> None:
+    existing = db.scalar(select(GenerationJob.id).where(GenerationJob.asset_id == asset.id).limit(1))
+    if existing is not None:
+        return
+    now = datetime.now(timezone.utc)
+    job = GenerationJob(
+        prompt=row.prompt,
+        backend="qubax",
+        status=PipelineStatus.done,
+        duration_s=float(asset.duration_s or 5.0),
+        width=int(asset.width or 720),
+        height=int(asset.height or 1280),
+        asset_id=asset.id,
+        stage="готово",
+        scheduled_at=row.created_at or now,
+        finished_at=now,
+    )
+    db.add(job)
+    db.commit()
+
+
+def _persist_completed(db: Session, row: QubaxVideoJob) -> QubaxVideoJob:
+    if row.status != "completed" or not row.video_url:
+        return row
+    try:
+        asset = _download_into_library(db, row)
+    except Exception:
+        return row
+    _ensure_render(db, row, asset)
+    return row
 
 
 def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
-    if qx.is_terminal_status(row.status):
-        return row
+    if not _needs_remote_refresh(row):
+        return _persist_completed(db, row)
     try:
         body = qx.get_video_job(key, row.external_id)
     except qx.QubaxError as exc:
         if qx.is_missing_generation(exc):
-            if _job_is_fresh(row):
+            if _within_generation_window(row):
+                if row.status != "pending" or row.last_error or row.completed_at is not None:
+                    row.status = "pending"
+                    row.last_error = None
+                    row.completed_at = None
+                    db.add(row)
+                    db.commit()
+                    db.refresh(row)
                 return row
             row.status = "failed"
             row.last_error = qx.MISSING_GENERATION_TEXT
@@ -159,7 +250,7 @@ def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
     db.add(row)
     db.commit()
     db.refresh(row)
-    return row
+    return _persist_completed(db, row)
 
 
 def _panel_settings_out(db: Session, request: Request | None = None) -> QubaxPanelSettingsOut:
@@ -397,6 +488,7 @@ def _submit_one(
     db.add(row)
     db.commit()
     db.refresh(row)
+    _persist_completed(db, row)
     set_qubax_last_form(
         db,
         {
@@ -415,7 +507,7 @@ def _submit_one(
 def create_job(payload: QubaxJobCreateIn, db: Session = Depends(get_db)) -> QubaxJobOut:
     key = _key_or_400(db)
     row = _submit_one(db, key, payload)
-    return _job_out(row)
+    return _job_out(db, row)
 
 
 @router.post("/jobs/batch", response_model=QubaxJobListOut)
@@ -443,7 +535,7 @@ def create_batch(payload: QubaxBatchCreateIn, db: Session = Depends(get_db)) -> 
             "variant_models": variant_models,
         },
     )
-    return QubaxJobListOut(items=[_job_out(r) for r in items], total=len(items))
+    return QubaxJobListOut(items=[_job_out(db, r) for r in items], total=len(items))
 
 
 @router.get("/jobs", response_model=QubaxJobListOut)
@@ -465,9 +557,9 @@ def list_jobs(
         key = resolve_qubax_api_key(db)
         if key:
             for row in rows:
-                if not qx.is_terminal_status(row.status):
+                if _needs_remote_refresh(row) or row.status == "completed":
                     _refresh_job(db, row, key)
-    return QubaxJobListOut(items=[_job_out(r) for r in rows], total=total)
+    return QubaxJobListOut(items=[_job_out(db, r) for r in rows], total=total)
 
 
 @router.get("/jobs/{job_id}", response_model=QubaxJobOut)
@@ -477,7 +569,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> QubaxJobOut:
         raise HTTPException(status_code=404, detail="Задача не найдена")
     key = _key_or_400(db)
     row = _refresh_job(db, row, key)
-    return _job_out(row)
+    return _job_out(db, row)
 
 
 @router.post("/jobs/{job_id}/import", response_model=QubaxImportOut)
@@ -489,36 +581,13 @@ def import_job(job_id: int, db: Session = Depends(get_db)) -> QubaxImportOut:
     row = _refresh_job(db, row, key)
     if row.status != "completed" or not row.video_url:
         raise HTTPException(status_code=409, detail="Видео ещё не готово")
-    if row.media_asset_id is not None:
-        asset = db.get(MediaAsset, row.media_asset_id)
-        if asset is not None:
-            return QubaxImportOut(
-                job_id=row.id, media_asset_id=asset.id, filename=asset.filename
-            )
-    final_name = f"{uuid.uuid4().hex}.mp4"
-    dest = settings.media_dir / final_name
-    settings.media_dir.mkdir(parents=True, exist_ok=True)
-    with http_client(settings, timeout=300) as client:
+    if row.media_asset_id is None:
         try:
-            download_url(client, row.video_url, dest, name="qubax")
+            _download_into_library(db, row)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    probe = probe_video(dest)
-    params = _params_dict(row.params_json)
-    asset = MediaAsset(
-        filename=final_name,
-        kind=AssetKind.video,
-        source=AssetSource.generated,
-        label=str(params.get("batch_label") or f"qubax:{row.model}")[:120],
-        generator=row.model,
-        prompt=row.prompt,
-        duration_s=probe.duration_s,
-        width=probe.width,
-        height=probe.height,
-    )
-    db.add(asset)
-    db.flush()
-    row.media_asset_id = asset.id
-    db.add(row)
-    db.commit()
-    return QubaxImportOut(job_id=row.id, media_asset_id=asset.id, filename=final_name)
+    asset = db.get(MediaAsset, row.media_asset_id) if row.media_asset_id else None
+    if asset is None:
+        raise HTTPException(status_code=502, detail="Не удалось сохранить видео")
+    _ensure_render(db, row, asset)
+    return QubaxImportOut(job_id=row.id, media_asset_id=asset.id, filename=asset.filename)

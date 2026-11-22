@@ -696,6 +696,7 @@ export const api = {
           cost_usd: number;
           backend?: string;
           asset_id?: number | null;
+          asset_filename?: string | null;
           offer_local_switch?: boolean;
           poll_timeout_ms?: number;
         }>
@@ -712,6 +713,7 @@ export const api = {
         cost_usd: number;
         backend?: string;
         asset_id?: number | null;
+        asset_filename?: string | null;
         offer_local_switch?: boolean;
         poll_timeout_ms?: number;
       }>(`/api/generations/${id}`),

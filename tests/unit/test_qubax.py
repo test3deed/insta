@@ -330,6 +330,7 @@ def _qubax_http(status_code: int, body: dict):
 def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_client, app_env):
     from datetime import datetime, timedelta, timezone
 
+    from app.config import settings
     from app.db.models import QubaxVideoJob
 
     db = app_env.SessionLocal()
@@ -344,7 +345,8 @@ def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_clien
         model="kling-v3-standard-text-to-video",
         prompt="forest",
         status="pending",
-        created_at=datetime.now(timezone.utc) - timedelta(seconds=31),
+        created_at=datetime.now(timezone.utc)
+        - timedelta(seconds=float(settings.generation_timeout_seconds) + 5),
     )
     db.add(fresh)
     db.add(old)
@@ -372,17 +374,133 @@ def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_clien
     assert second.status_code == 200
     again = {job["id"]: job for job in second.json()["items"]}
     assert again[fresh_id]["status"] == "pending"
+    assert not again[fresh_id]["last_error"]
     assert again[old_id]["status"] == "failed"
-    assert mock_client.get.call_count == 3
+    assert again[old_id]["last_error"] == qx.MISSING_GENERATION_TEXT
+    assert mock_client.get.call_count == 4
 
 
-def test_worker_does_not_retry_a_missing_generation():
+@patch("app.api.routes.qubax._download_into_library", side_effect=RuntimeError("disk"))
+@patch("app.services.qubax.http_client")
+def test_refresh_reopens_a_missing_job_when_the_video_exists(
+    mock_client_factory, _download, auth_client, app_env
+):
+    from app.db.models import QubaxVideoJob
+
+    db = app_env.SessionLocal()
+    row = QubaxVideoJob(
+        external_id="done-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="forest",
+        status="failed",
+        last_error=qx.MISSING_GENERATION_TEXT,
+    )
+    db.add(row)
+    db.commit()
+    job_id = row.id
+    db.close()
+
+    mock_client = _qubax_http(
+        200,
+        {"status": "completed", "video_url": "https://cdn.example/v.mp4"},
+    )
+    mock_client_factory.return_value = mock_client
+
+    response = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert response.status_code == 200
+    item = response.json()["items"][0]
+    assert item["id"] == job_id
+    assert item["status"] == "completed"
+    assert item["video_url"] == "https://cdn.example/v.mp4"
+    assert not item["last_error"]
+    assert mock_client.get.call_count == 1
+
+
+@patch("app.api.routes.qubax.probe_video")
+@patch("app.api.routes.qubax.download_url")
+@patch("app.services.qubax.http_client")
+def test_completed_job_is_saved_and_listed_as_render(
+    mock_client_factory, _download, mock_probe, auth_client, app_env
+):
+    from app.db.models import QubaxVideoJob
+    from app.services.media import Probe
+
+    db = app_env.SessionLocal()
+    row = QubaxVideoJob(
+        external_id="saved-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="forest at dawn",
+        status="pending",
+    )
+    db.add(row)
+    db.commit()
+    db.close()
+
+    mock_probe.return_value = Probe(duration_s=5, width=720, height=1280)
+    mock_client = _qubax_http(
+        200,
+        {"status": "completed", "video_url": "https://cdn.example/v.mp4"},
+    )
+    mock_client_factory.return_value = mock_client
+
+    first = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert first.status_code == 200
+    job = first.json()["items"][0]
+    assert job["status"] == "completed"
+    assert job["media_asset_id"]
+    assert job["media_filename"].endswith(".mp4")
+
+    renders = auth_client.get("/api/generations", headers=_h())
+    assert renders.status_code == 200
+    qubax_rows = [item for item in renders.json() if item["backend"] == "qubax"]
+    assert len(qubax_rows) == 1
+    assert qubax_rows[0]["status"] == "done"
+    assert qubax_rows[0]["prompt"] == "forest at dawn"
+    assert qubax_rows[0]["asset_filename"] == job["media_filename"]
+
+    second = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert second.status_code == 200
+    again = auth_client.get("/api/generations", headers=_h())
+    qubax_again = [item for item in again.json() if item["backend"] == "qubax"]
+    assert len(qubax_again) == 1
+    assert qubax_again[0]["id"] == qubax_rows[0]["id"]
+
+
+def test_worker_keeps_polling_until_a_missing_generation_appears():
+    from app.config import get_settings
+    from app.generation.qubax import QubaxVideoBackend
+
+    cfg = get_settings().model_copy(
+        update={"generation_timeout_seconds": 30, "generation_poll_seconds": 0}
+    )
+    backend = QubaxVideoBackend(cfg)
+    missing = qx.QubaxError("Video generation not found.", status_code=400, missing=True)
+    calls = {"n": 0}
+
+    def side_effect(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise missing
+        return {"status": "completed", "video_url": "https://cdn.example/v.mp4"}
+
+    with patch("app.services.qubax.get_video_job", side_effect=side_effect):
+        body = backend._await_result("key", "late-1", lambda _progress: None)
+    assert body["status"] == "completed"
+    assert calls["n"] == 2
+
+
+def test_worker_fails_a_missing_generation_after_the_timeout():
+    from app.config import get_settings
     from app.generation.base import GenerationError
     from app.generation.qubax import QubaxVideoBackend
 
-    backend = QubaxVideoBackend()
+    cfg = get_settings().model_copy(
+        update={"generation_timeout_seconds": 0, "generation_poll_seconds": 0}
+    )
+    backend = QubaxVideoBackend(cfg)
     missing = qx.QubaxError("Video generation not found.", status_code=400, missing=True)
     with patch("app.services.qubax.get_video_job", side_effect=missing):
         with pytest.raises(GenerationError) as caught:
             backend._await_result("key", "gone-1", lambda _progress: None)
     assert caught.value.retryable is False
+    assert qx.MISSING_GENERATION_TEXT in str(caught.value)

@@ -12,6 +12,7 @@ import { Link } from "react-router-dom";
 import clsx from "clsx";
 
 import { api, formatApiError } from "../api/client";
+import { fetchMediaObjectUrl, revokeMediaObjectUrl } from "../api/media";
 import type {
   QubaxBatchVariantIn,
   QubaxEstimateOut,
@@ -25,6 +26,43 @@ import { useConfirm } from "../context/ConfirmContext";
 import { usePollWhenVisible } from "../hooks/usePollWhenVisible";
 import { useToast } from "../context/ToastContext";
 import { EmptyState } from "./EmptyState";
+
+function QubaxJobPlayer({ job }: { job: QubaxJobOut }) {
+  const remote = job.video_url || "";
+  const [src, setSrc] = useState(remote);
+
+  useEffect(() => {
+    if (job.status !== "completed") return;
+    if (!job.media_filename) {
+      setSrc(remote);
+      return;
+    }
+    let cancelled = false;
+    let objectUrl = "";
+    fetchMediaObjectUrl(job.media_filename)
+      .then((url) => {
+        objectUrl = url;
+        if (!cancelled) setSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setSrc(remote);
+      });
+    return () => {
+      cancelled = true;
+      revokeMediaObjectUrl(objectUrl);
+    };
+  }, [job.media_filename, job.status, remote]);
+
+  if (job.status !== "completed" || !src) return null;
+  return (
+    <video
+      src={src}
+      controls
+      playsInline
+      className="mb-2 aspect-[9/16] max-h-72 w-full rounded bg-black object-contain"
+    />
+  );
+}
 
 const DURATIONS = ["3s", "5s", "10s", "15s"] as const;
 const ASPECTS = ["9:16", "16:9", "1:1", "4:3", "3:4"] as const;
@@ -261,7 +299,7 @@ export function QubaxPanel() {
   const loadJobs = useCallback(async () => {
     if (!status?.configured) return;
     try {
-      const out = await api.qubax.listJobs({ limit: 50 });
+      const out = await api.qubax.listJobs({ limit: 50, sync_active: true });
       setJobs(out.items || []);
     } catch (err) {
       push(formatApiError(err), "error");
@@ -959,9 +997,10 @@ export function QubaxPanel() {
             {!jobs.length ? (
               <p className="text-sm text-slate-500">Пока нет генераций.</p>
             ) : (
-              <ul className="space-y-3">
+              <ul className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
                 {jobs.map((job) => (
-                  <li key={job.id} className="rounded-lg bg-slate-900/60 p-3 text-sm" data-testid={`qubax-job-${job.id}`}>
+                  <li key={job.id} className="flex flex-col rounded-lg bg-slate-900/60 p-3 text-sm" data-testid={`qubax-job-${job.id}`}>
+                    <QubaxJobPlayer job={job} />
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-medium text-slate-200">{job.model}</span>
                       <span
@@ -978,12 +1017,11 @@ export function QubaxPanel() {
                       </span>
                     </div>
                     <p className="mt-1 line-clamp-2 text-xs text-slate-400">{job.prompt}</p>
-                    {job.last_error ? <p className="mt-1 text-xs text-rose-400">{job.last_error}</p> : null}
-                    {job.status === "completed" && job.video_url ? (
-                      <video src={job.video_url} controls className="mt-2 max-h-48 w-full rounded bg-black" />
+                    {job.last_error && job.status !== "completed" ? (
+                      <p className="mt-1 text-xs text-rose-400">{job.last_error}</p>
                     ) : null}
                     <div className="mt-2 flex flex-wrap gap-2">
-                      {job.status === "completed" ? (
+                      {job.status === "completed" && !job.media_asset_id ? (
                         <button
                           type="button"
                           className="btn-secondary text-xs"

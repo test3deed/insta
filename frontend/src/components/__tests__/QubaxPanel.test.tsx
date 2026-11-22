@@ -149,6 +149,35 @@ describe("QubaxPanel", () => {
     await waitFor(() => expect(apiMock.qubax.createBatch).toHaveBeenCalled());
   });
 
+  it("shows a completed job as a video in the task gallery", async () => {
+    apiMock.qubax.status.mockResolvedValue({
+      configured: true,
+      key_from_env: false,
+      balance: 1,
+    });
+    apiMock.qubax.models.mockResolvedValue({ presets: [], models: [] });
+    apiMock.qubax.listJobs.mockResolvedValue({
+      items: [
+        {
+          id: 7,
+          external_id: "ext",
+          model: "kling-v3-standard-text-to-video",
+          prompt: "forest",
+          status: "completed",
+          video_url: "https://cdn.example/v.mp4",
+        },
+      ],
+      total: 1,
+    });
+    render(
+      <MemoryRouter>
+        <QubaxPanel />
+      </MemoryRouter>
+    );
+    const card = await screen.findByTestId("qubax-job-7");
+    expect(card.querySelector("video")).toHaveAttribute("src", "https://cdn.example/v.mp4");
+  });
+
   it("apply suggested public url fills input", async () => {
     apiMock.qubax.status.mockResolvedValue({
       configured: true,
