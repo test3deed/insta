@@ -21,6 +21,10 @@ export function AgentRunOverlay() {
   const [pending, setPending] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
+  const live =
+    job != null &&
+    (job.status === "running" || job.status === "paused" || job.status === "needs_user");
+
   useEffect(() => {
     let stop = false;
     const tick = async () => {
@@ -38,14 +42,18 @@ export function AgentRunOverlay() {
       }
     };
     void tick();
-    const timer = window.setInterval(() => void tick(), 500);
-    const clock = window.setInterval(() => setNow(Date.now()), 1000);
+    const timer = window.setInterval(() => void tick(), live ? 500 : 4000);
     return () => {
       stop = true;
       window.clearInterval(timer);
-      window.clearInterval(clock);
     };
-  }, []);
+  }, [live]);
+
+  useEffect(() => {
+    if (!live) return;
+    const clock = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(clock);
+  }, [live]);
 
   const act = async (kind: "pause" | "resume" | "stop") => {
     if (!job || pending) return;

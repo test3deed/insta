@@ -40,6 +40,17 @@ beforeEach(() => {
 });
 
 describe("AgentRunOverlay", () => {
+  it("polls slowly while no task is on screen", async () => {
+    const spy = vi.spyOn(window, "setInterval");
+    vi.mocked(api.assistantJobs.active).mockResolvedValue(null);
+    render(<AgentRunOverlay />);
+    await waitFor(() => expect(api.assistantJobs.active).toHaveBeenCalled());
+    const delays = spy.mock.calls.map((call) => call[1]);
+    expect(delays).toContain(4000);
+    expect(delays).not.toContain(500);
+    spy.mockRestore();
+  });
+
   it("stays hidden while the run is only waiting on the model", async () => {
     vi.mocked(api.assistantJobs.active).mockResolvedValue(job());
     render(<AgentRunOverlay />);

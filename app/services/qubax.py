@@ -67,10 +67,24 @@ _VIDEO_ID_HINTS = (
 )
 
 
+MISSING_GENERATION_TEXT = "Генерация у Qubax не найдена. Нужна новая отправка."
+
+
 class QubaxError(Exception):
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        missing: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.missing = missing
+
+
+def is_missing_generation(exc: BaseException) -> bool:
+    return isinstance(exc, QubaxError) and exc.missing
 
 
 _models_cache: tuple[float, list[dict[str, Any]]] | None = None
@@ -97,6 +111,15 @@ def _explain_http(exc: BaseException) -> str:
     return f"Ошибка Qubax: {text}" if text else "Ошибка Qubax."
 
 
+def _error_text(value: Any) -> str:
+    if isinstance(value, dict):
+        message = value.get("message") or value.get("type") or ""
+        return str(message).strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _raise_http(response: httpx.Response, *, context: str) -> None:
     if response.status_code < 400:
         return
@@ -109,16 +132,16 @@ def _raise_http(response: httpx.Response, *, context: str) -> None:
     try:
         body = response.json()
         if isinstance(body, dict):
-            detail = str(
-                body.get("error")
-                or body.get("message")
-                or body.get("detail")
-                or ""
-            ).strip()
+            detail = (
+                _error_text(body.get("error"))
+                or _error_text(body.get("message"))
+                or _error_text(body.get("detail"))
+            )
     except (json.JSONDecodeError, ValueError):
         detail = (response.text or "")[:240].strip()
     msg = detail or f"HTTP {response.status_code} ({context})"
-    raise QubaxError(msg, status_code=response.status_code)
+    missing = response.status_code == 404 or "not found" in msg.lower()
+    raise QubaxError(msg, status_code=response.status_code, missing=missing)
 
 
 def filter_video_models(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

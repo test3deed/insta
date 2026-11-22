@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from typing import List
 from zoneinfo import ZoneInfo
@@ -9,13 +10,12 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.accounts.backup_codes import parse_account_line, serialize_backup_codes
 from app.accounts.connection_test import run_account_connection_test
 from app.accounts.cookie_formats import CookieFormatError, import_cookies_data, write_dolphin_cookies_export
 from app.accounts.device_factory import DeviceFingerprint, device_path, load_fingerprint, save_fingerprint
-from app.accounts.first_login_service import run_account_first_login
 from app.accounts.mint_mobile_session import mint_mobile_session
 from app.accounts.playwright_session import (
     clear_playwright_state,
@@ -54,6 +54,9 @@ from app.geo.timezone_normalize import (
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"], dependencies=[AuthDep])
 
+_SESSION_FILE_TTL_S = 5.0
+_session_file_cache: dict[str, tuple[float, tuple]] = {}
+
 
 def _account_session_fields(username: str, db_session_id: str | None, platform: str = "instagram"):
     if platform in ("youtube", "tiktok"):
@@ -76,6 +79,29 @@ def _account_session_fields(username: str, db_session_id: str | None, platform: 
     return file_exists, updated_at, source
 
 
+def _account_session_fields_cached(username: str, db_session_id: str | None, platform: str = "instagram"):
+    now = time.monotonic()
+    cached = _session_file_cache.get(username)
+    if cached is not None and now - cached[0] < _SESSION_FILE_TTL_S:
+        return cached[1]
+    value = _account_session_fields(username, db_session_id, platform)
+    _session_file_cache[username] = (now, value)
+    return value
+
+
+def _stats_by_account(db: Session, accounts: list[Account]) -> dict[tuple[int, str], DailyStat]:
+    if not accounts:
+        return {}
+    keys = {_account_local_today(account) for account in accounts}
+    rows = db.scalars(
+        select(DailyStat).where(
+            DailyStat.account_id.in_([account.id for account in accounts]),
+            DailyStat.date_key.in_(keys),
+        )
+    ).all()
+    return {(row.account_id, row.date_key): row for row in rows}
+
+
 def _account_local_today(account: Account) -> str:
     """Calendar date_key for DailyStat, matching planner increment_daily_stat."""
     try:
@@ -92,32 +118,43 @@ def _account_platform_value(account: Account) -> str:
     return value or "instagram"
 
 
-def _serialize(account: Account, *, db: Session) -> AccountOut:
+def _serialize(
+    account: Account,
+    *,
+    db: Session,
+    stats: dict[tuple[int, str], DailyStat] | None = None,
+    cache_session: bool = False,
+) -> AccountOut:
     proxy_label = None
     proxy_country = None
     proxy_geo_country = None
     proxy_is_healthy = None
     proxy_last_ip = None
-    if account.proxy_id is not None:
+    proxy = account.proxy if account.proxy_id is not None else None
+    if proxy is None and account.proxy_id is not None:
         proxy = db.get(Proxy, account.proxy_id)
-        if proxy is not None:
-            proxy_label = proxy.label
-            proxy_country = proxy.country
-            proxy_geo_country = proxy.last_geo_country
-            proxy_is_healthy = proxy.is_healthy
-            proxy_last_ip = proxy.last_known_ip
+    if proxy is not None:
+        proxy_label = proxy.label
+        proxy_country = proxy.country
+        proxy_geo_country = proxy.last_geo_country
+        proxy_is_healthy = proxy.is_healthy
+        proxy_last_ip = proxy.last_known_ip
 
     today = _account_local_today(account)
-    stat = db.scalar(
-        select(DailyStat).where(
-            DailyStat.account_id == account.id,
-            DailyStat.date_key == today,
+    if stats is None:
+        stat = db.scalar(
+            select(DailyStat).where(
+                DailyStat.account_id == account.id,
+                DailyStat.date_key == today,
+            )
         )
-    )
+    else:
+        stat = stats.get((account.id, today))
     posts_today = stat.posts_count if stat else 0
     failures_today = stat.failures_count if stat else 0
 
-    file_exists, file_updated_at, session_source = _account_session_fields(
+    session_lookup = _account_session_fields_cached if cache_session else _account_session_fields
+    file_exists, file_updated_at, session_source = session_lookup(
         account.username,
         account.session_id,
         platform=_account_platform_value(account),
@@ -166,8 +203,14 @@ def _serialize(account: Account, *, db: Session) -> AccountOut:
 
 @router.get("", response_model=List[AccountOut])
 def list_accounts(db: Session = Depends(get_db)) -> List[AccountOut]:
-    rows = db.scalars(select(Account).order_by(Account.username)).all()
-    return [_serialize(a, db=db) for a in rows]
+    rows = list(
+        db.scalars(select(Account).options(joinedload(Account.proxy)).order_by(Account.username)).unique().all()
+    )
+    stats = _stats_by_account(db, rows)
+    return [
+        _serialize(account, db=db, stats=stats, cache_session=True)
+        for account in rows
+    ]
 
 
 @router.post("", response_model=AccountOut, status_code=status.HTTP_201_CREATED)
@@ -188,6 +231,12 @@ def create_account(payload: AccountIn, db: Session = Depends(get_db)) -> Account
 
     account.platform = platform
     account.password = payload.password
+    from app.accounts.login_guard import ProxyOccupied, ensure_proxy_exclusive
+
+    try:
+        ensure_proxy_exclusive(db, proxy.id, account)
+    except ProxyOccupied as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     account.proxy_id = proxy.id
     if is_placeholder_timezone(payload.timezone):
         account.timezone = timezone_from_proxy(proxy.timezone, proxy.country)
@@ -299,6 +348,12 @@ def update_account_proxy(
     if proxy is None:
         raise HTTPException(status_code=400, detail=f"Прокси «{payload.proxy_label}» не найден")
 
+    from app.accounts.login_guard import ProxyOccupied, ensure_proxy_exclusive
+
+    try:
+        ensure_proxy_exclusive(db, proxy.id, account)
+    except ProxyOccupied as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     account.proxy_id = proxy.id
     account.timezone = timezone_from_proxy(proxy.timezone, proxy.country)
     db.commit()
@@ -647,17 +702,22 @@ def account_first_login(
             status_code=503,
             detail="Браузер Chromium не установлен — на сервере выполните install-playwright",
         )
-    platform = _account_platform_value(account)
-    from app.accounts.account_hints import enrich_first_login_out
+    from app.accounts.login_jobs import AccountMissing, start_panel_login
 
-    if platform in ("youtube", "tiktok"):
-        from app.accounts.studio_login_service import run_studio_login
+    try:
+        return start_panel_login(username, surface=login_surface)
+    except AccountMissing as exc:
+        raise HTTPException(status_code=404, detail=f"Аккаунт «{username}» не найден") from exc
 
-        return enrich_first_login_out(run_studio_login(account, db), account)
-    return enrich_first_login_out(
-        run_account_first_login(account, db, surface=login_surface),
-        account,
-    )
+
+@router.get("/{username}/first-login/current", response_model=FirstLoginOut)
+def account_first_login_current(username: str) -> FirstLoginOut:
+    from app.accounts.login_jobs import current_panel_login
+
+    current = current_panel_login(username)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Вход не запущен")
+    return current
 
 
 @router.post("/{username}/mint-mobile-session", response_model=MintMobileSessionOut)

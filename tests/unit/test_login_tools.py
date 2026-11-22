@@ -20,7 +20,7 @@ def test_login_instagram_returns_run_id(db_session, make_account, make_proxy, mo
     proxy = make_proxy(label="px-li")
     account = make_account(username="loguser", proxy=proxy)
 
-    def _fake_run(acc, db, *, surface=None, on_status=None):
+    def _fake_run(acc, db, *, surface=None, on_status=None, **kwargs):
         if on_status:
             on_status("Тест", "шаг")
         return FirstLoginOut(
@@ -49,7 +49,7 @@ def test_login_account_routes_studio(db_session, make_account, make_proxy, monke
     proxy = make_proxy(label="px-yt-la")
     account = make_account(username="ytla", proxy=proxy, platform=Platform.youtube)
 
-    def _fake_studio(acc, db, *, on_status=None):
+    def _fake_studio(acc, db, *, on_status=None, **kwargs):
         return FirstLoginOut(run_id=77, ok=True, session_imported=True, logs=[])
 
     monkeypatch.setattr(
@@ -76,7 +76,7 @@ def test_login_account_payload_includes_user_hint_on_failure(
         steps=["Шаг 1"],
     )
 
-    def _fake_run(acc, db, *, surface=None, on_status=None):
+    def _fake_run(acc, db, *, surface=None, on_status=None, **kwargs):
         return FirstLoginOut(
             run_id=1,
             ok=False,

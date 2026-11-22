@@ -135,7 +135,12 @@ def _refresh_job(db: Session, row: QubaxVideoJob, key: str) -> QubaxVideoJob:
     try:
         body = qx.get_video_job(key, row.external_id)
     except qx.QubaxError as exc:
-        row.last_error = str(exc)[:500]
+        if qx.is_missing_generation(exc):
+            row.status = "failed"
+            row.last_error = qx.MISSING_GENERATION_TEXT
+            row.completed_at = row.completed_at or datetime.now(timezone.utc)
+        else:
+            row.last_error = str(exc)[:500]
         db.add(row)
         db.commit()
         db.refresh(row)

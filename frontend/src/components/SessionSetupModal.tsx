@@ -242,14 +242,28 @@ export function SessionSetupModal({ account, open, onClose, onCompleted }: Props
     setBrowserSuccess(result.overall_ok === true);
   }
 
+  const loginPollStop = useRef(false);
+
+  useEffect(() => () => {
+    loginPollStop.current = true;
+  }, []);
+
   async function runAutoLogin() {
     if (!account) return;
+    loginPollStop.current = false;
     setAutoBusy(true);
     setFirstLoginResult(null);
     setConnectionResult(null);
     setBrowserSuccess(false);
     try {
-      const data = await api.accounts.firstLogin(account.username, { loginSurface });
+      let data = await api.accounts.firstLogin(account.username, { loginSurface });
+      while (data.pending) {
+        if (loginPollStop.current) return;
+        setFirstLoginResult(data);
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        if (loginPollStop.current) return;
+        data = await api.accounts.firstLoginCurrent(account.username);
+      }
       setFirstLoginResult(data);
       if (data.connection_test) {
         setConnectionResult(data.connection_test);

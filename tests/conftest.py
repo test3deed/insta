@@ -155,6 +155,39 @@ def app_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _login_probe_reaches_host(monkeypatch):
+    """Login tests must not open a real proxy. The guard test overrides this client."""
+    import httpx
+
+    from app.accounts import login_guard
+
+    class _Response:
+        status_code = 200
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            return _Response()
+
+    class _Httpx:
+        Client = _Client
+        TimeoutException = httpx.TimeoutException
+        HTTPError = httpx.HTTPError
+        HTTPTransport = httpx.HTTPTransport
+
+    monkeypatch.setattr(login_guard, "httpx", _Httpx)
+    monkeypatch.setattr(login_guard, "outside_active_hours", lambda account, now=None: False)
+
+
 @pytest.fixture()
 def db_session(app_env):
     session = app_env.SessionLocal()
@@ -170,16 +203,34 @@ def db_session(app_env):
 @pytest.fixture()
 def make_proxy(db_session):
     """Factory: create a Proxy row and return it. Default label is auto-incrementing."""
+    from datetime import datetime
+    from datetime import timezone as dt_timezone
+
     from app.db import Proxy
 
     counter = {"i": 0}
 
-    def _make(label: str | None = None, url: str = "http://u:p@host:8000", country: str = "US",
-              timezone: str = "UTC", is_healthy: bool = True) -> Proxy:
+    def _make(
+        label: str | None = None,
+        url: str = "http://u:p@host:8000",
+        country: str = "US",
+        timezone: str = "UTC",
+        is_healthy: bool = True,
+        last_checked_at: datetime | None = None,
+        checked: bool = True,
+    ) -> Proxy:
         if label is None:
             counter["i"] += 1
             label = f"proxy-{counter['i']}"
-        proxy = Proxy(label=label, url=url, country=country, timezone=timezone, is_healthy=is_healthy)
+        checked_at = datetime.now(dt_timezone.utc) if checked and last_checked_at is None else last_checked_at
+        proxy = Proxy(
+            label=label,
+            url=url,
+            country=country,
+            timezone=timezone,
+            is_healthy=is_healthy,
+            last_checked_at=checked_at,
+        )
         db_session.add(proxy)
         db_session.commit()
         db_session.refresh(proxy)

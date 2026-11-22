@@ -807,3 +807,57 @@ def test_tiktok_dispatches_to_playwright_publisher(
     db_session.refresh(job)
     assert job.status == PostJobStatus.done
 
+
+def test_factory_claims_generation_while_post_is_running(
+    worker_env, db_session, make_account, monkeypatch
+):
+    from app.db import GenerationJob, PipelineStatus
+
+    account = make_account(username="factory-busy")
+    post = _make_job(
+        db_session,
+        account,
+        _make_video(worker_env, "busy.mp4"),
+        status=PostJobStatus.running,
+    )
+    gen = GenerationJob(
+        prompt="a cat on a roof",
+        status=PipelineStatus.queued,
+        scheduled_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db_session.add(gen)
+    db_session.commit()
+    seen: dict[str, int] = {}
+
+    def _run(db, job, **kwargs):
+        seen["id"] = job.id
+
+    monkeypatch.setattr(worker_module, "run_generation_job", _run)
+    worker_module.run_factory_once()
+    assert seen["id"] == gen.id
+    db_session.refresh(post)
+    db_session.refresh(gen)
+    assert post.status == PostJobStatus.running
+    assert gen.status == PipelineStatus.running
+
+
+def test_idle_warmup_skips_while_a_post_is_queued(
+    worker_env, db_session, make_account, monkeypatch
+):
+    account = make_account(username="warmup-wait")
+    _make_job(
+        db_session,
+        account,
+        _make_video(worker_env, "later.mp4"),
+        when=datetime.now(timezone.utc) + timedelta(hours=2),
+    )
+    called = {"n": 0}
+
+    def _warmup(*args, **kwargs):
+        called["n"] += 1
+        return False
+
+    monkeypatch.setattr(worker_module, "maybe_run_idle_warmup", _warmup)
+    worker_module.run_publish_once()
+    assert called["n"] == 0
+

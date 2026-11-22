@@ -91,6 +91,9 @@ def _finish_success(
         "Web-сессия сохранена; mobile API-проверка пропущена "
         "(чтобы не инвалидировать sessionid). При необходимости проверьте подключение отдельно.",
     )
+    from app.accounts.login_guard import record_login_outcome
+
+    record_login_outcome(account, db, ok=True)
     collector.finish("ok", summary or "Сессия создана")
     return FirstLoginOut(
         run_id=collector.run_id,
@@ -136,6 +139,9 @@ def _try_mint_fallback(
     if mint.challenge:
         ladder.fail(METHOD_MINT_MOBILE, error=mint.error or "challenge")
         collector.finish("warn", CHALLENGE_SUMMARY)
+        from app.accounts.login_guard import record_login_outcome
+
+        record_login_outcome(account, db, ok=False, challenge=True, error=mint.error)
         return FirstLoginOut(
             run_id=collector.run_id,
             ok=False,
@@ -211,6 +217,9 @@ def _try_api_login_fallback(
             ladder.fail(METHOD_MOBILE_API, error=str(exc) or "challenge")
         collector.warn("login", "Требуется ручное подтверждение (challenge) — откройте вкладку «Браузер»")
         collector.finish("warn", CHALLENGE_SUMMARY)
+        from app.accounts.login_guard import record_login_outcome
+
+        record_login_outcome(account, db, ok=False, challenge=True, error=str(exc))
         return (
             FirstLoginOut(
                 run_id=collector.run_id,
@@ -246,6 +255,9 @@ def _try_api_login_fallback(
                     ladder.fail(METHOD_MOBILE_API, error=str(exc) or "challenge")
                 collector.warn("login", "Требуется ручное подтверждение (challenge) — откройте вкладку «Браузер»")
                 collector.finish("warn", CHALLENGE_SUMMARY)
+                from app.accounts.login_guard import record_login_outcome
+
+                record_login_outcome(account, db, ok=False, challenge=True, error=str(exc))
                 return (
                     FirstLoginOut(
                         run_id=collector.run_id,
@@ -315,25 +327,27 @@ def _after_playwright_miss(
     login_debug: bool,
     on_status=None,
 ) -> FirstLoginOut:
-    if on_status:
-        on_status("API", "браузер не дал sessionid — mobile API")
-    fallback_out, api_err = _try_api_login_fallback(
-        collector, account, db, proxy, fingerprint, ladder=ladder
-    )
-    if fallback_out is not None:
-        return fallback_out
-    mint_out = _try_mint_fallback(ladder, collector, account, db, proxy, fingerprint)
-    if mint_out is not None:
-        return mint_out
-    final_error = api_err or browser_error
-    if api_err and "Неверный пароль" in api_err:
-        final_error = api_err
-    collector.finish("fail", ladder.summary_fail(final_error))
+    _ = (account, db, proxy, fingerprint, on_status)
+    collector.finish("fail", ladder.summary_fail(browser_error))
     return FirstLoginOut(
         run_id=collector.run_id,
         ok=False,
-        error=final_error,
+        error=browser_error,
         login_debug_available=login_debug,
+        logs=[DiagnosticLogLineOut(**line.__dict__) for line in collector.lines],
+    )
+
+
+def _blocked(
+    collector: DiagnosticCollector,
+    message: str,
+) -> FirstLoginOut:
+    collector.error("login", message)
+    collector.finish("fail", message)
+    return FirstLoginOut(
+        run_id=collector.run_id,
+        ok=False,
+        error=message,
         logs=[DiagnosticLogLineOut(**line.__dict__) for line in collector.lines],
     )
 
@@ -344,12 +358,15 @@ def run_account_first_login(
     *,
     surface: str | None = None,
     on_status=None,
+    submitting_code: bool = False,
+    collector: DiagnosticCollector | None = None,
 ) -> FirstLoginOut:
-    collector = DiagnosticCollector(
-        db,
-        kind=DiagnosticRunKind.first_login,
-        account_id=account.id,
-    )
+    if collector is None:
+        collector = DiagnosticCollector(
+            db,
+            kind=DiagnosticRunKind.first_login,
+            account_id=account.id,
+        )
     ladder = ConnectionLadder(collector)
 
     if not playwright_browsers_available():
@@ -410,7 +427,21 @@ def run_account_first_login(
             summary=ladder.summary_ok(),
         )
 
-    resolved_surface = resolve_playwright_surface(surface or account.login_surface)
+    from app.accounts.login_guard import assert_login_allowed
+
+    allowance = assert_login_allowed(
+        db,
+        account,
+        proxy,
+        surface=surface,
+        submitting_code=submitting_code,
+    )
+    if allowance.surface_note:
+        collector.info("login", allowance.surface_note)
+    if not allowance.allowed:
+        return _blocked(collector, allowance.error)
+
+    resolved_surface = resolve_playwright_surface(allowance.surface or surface or account.login_surface)
     account.login_surface = resolved_surface
     db.commit()
 
@@ -482,6 +513,9 @@ def run_account_first_login(
         collector.warn("login", hint)
         _log_playwright_failure_diagnostics(collector, account, result)
         collector.finish("warn", CHALLENGE_SUMMARY)
+        from app.accounts.login_guard import record_login_outcome
+
+        record_login_outcome(account, db, ok=False, challenge=True, error=result.error)
         return FirstLoginOut(
             run_id=collector.run_id,
             ok=False,
@@ -495,7 +529,7 @@ def run_account_first_login(
 
     if not result.ok:
         msg = result.error or "Автовход не удался"
-        ladder.fail(METHOD_PLAYWRIGHT, error=msg, next_method=METHOD_MOBILE_API)
+        ladder.fail(METHOD_PLAYWRIGHT, error=msg, next_method=None)
         collector.error("login", msg)
         _log_playwright_failure_diagnostics(collector, account, result)
         return _after_playwright_miss(
@@ -526,7 +560,7 @@ def run_account_first_login(
         else:
             import_err = "Не удалось извлечь sessionid из Playwright state (файл пуст или отсутствует)"
         collector.error("import", import_err)
-        ladder.fail(METHOD_PLAYWRIGHT, error=import_err, next_method=METHOD_MOBILE_API)
+        ladder.fail(METHOD_PLAYWRIGHT, error=import_err, next_method=None)
         _log_playwright_failure_diagnostics(collector, account, result)
         return _after_playwright_miss(
             ladder,

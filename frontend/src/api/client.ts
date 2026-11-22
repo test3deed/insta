@@ -416,6 +416,10 @@ export const api = {
           query: opts?.loginSurface ? { login_surface: opts.loginSurface } : undefined,
         }
       ),
+    firstLoginCurrent: (username: string) =>
+      request<FirstLoginOut>(
+        `/api/accounts/${encodeURIComponent(username)}/first-login/current`,
+      ),
     mintMobileSession: (username: string) =>
       request<MintMobileSessionOut>(
         `/api/accounts/${encodeURIComponent(username)}/mint-mobile-session`,

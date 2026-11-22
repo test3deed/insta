@@ -300,3 +300,75 @@ def test_create_job_without_key(auth_client_no_qubax):
         json={"model": "video-gen", "prompt": "x"},
     )
     assert r.status_code == 400
+
+
+def test_nested_not_found_error_is_a_missing_generation():
+    response = MagicMock()
+    response.status_code = 400
+    response.json.return_value = {
+        "error": {"type": "invalid_request_error", "message": "Video generation not found."}
+    }
+    with pytest.raises(qx.QubaxError) as caught:
+        qx._raise_http(response, context="status")
+    assert str(caught.value) == "Video generation not found."
+    assert qx.is_missing_generation(caught.value)
+
+
+def _qubax_http(status_code: int, body: dict):
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.json.return_value = body
+    mock_response.text = ""
+    mock_client.get.return_value = mock_response
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    return mock_client
+
+
+@patch("app.services.qubax.http_client")
+def test_refresh_marks_missing_generation_failed(mock_client_factory, auth_client, app_env):
+    from app.db.models import QubaxVideoJob
+
+    db = app_env.SessionLocal()
+    row = QubaxVideoJob(
+        external_id="gone-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="forest",
+        status="pending",
+    )
+    db.add(row)
+    db.commit()
+    job_id = row.id
+    db.close()
+
+    mock_client = _qubax_http(
+        400,
+        {"error": {"type": "invalid_request_error", "message": "Video generation not found."}},
+    )
+    mock_client_factory.return_value = mock_client
+
+    first = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert first.status_code == 200
+    item = next(job for job in first.json()["items"] if job["id"] == job_id)
+    assert item["status"] == "failed"
+    assert item["last_error"] == qx.MISSING_GENERATION_TEXT
+    assert mock_client.get.call_count == 1
+
+    second = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert second.status_code == 200
+    again = next(job for job in second.json()["items"] if job["id"] == job_id)
+    assert again["status"] == "failed"
+    assert mock_client.get.call_count == 1
+
+
+def test_worker_does_not_retry_a_missing_generation():
+    from app.generation.base import GenerationError
+    from app.generation.qubax import QubaxVideoBackend
+
+    backend = QubaxVideoBackend()
+    missing = qx.QubaxError("Video generation not found.", status_code=400, missing=True)
+    with patch("app.services.qubax.get_video_job", side_effect=missing):
+        with pytest.raises(GenerationError) as caught:
+            backend._await_result("key", "gone-1", lambda _progress: None)
+    assert caught.value.retryable is False

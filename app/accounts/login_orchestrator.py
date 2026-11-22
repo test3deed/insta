@@ -26,13 +26,25 @@ def run_autonomous_account_login(
     *,
     surface: str | None = None,
     on_status: StatusCallback | None = None,
+    submitting_code: bool = False,
 ) -> FirstLoginOut:
     plat = _platform_value(account)
     if plat in ("youtube", "tiktok"):
         from app.accounts.studio_login_service import run_studio_login
 
-        return run_studio_login(account, db, on_status=on_status)
-    return run_autonomous_instagram_login(account, db, surface=surface, on_status=on_status)
+        return run_studio_login(
+            account,
+            db,
+            on_status=on_status,
+            submitting_code=submitting_code,
+        )
+    return run_autonomous_instagram_login(
+        account,
+        db,
+        surface=surface,
+        on_status=on_status,
+        submitting_code=submitting_code,
+    )
 
 
 def run_autonomous_instagram_login(
@@ -41,6 +53,7 @@ def run_autonomous_instagram_login(
     *,
     surface: str | None = None,
     on_status: StatusCallback | None = None,
+    submitting_code: bool = False,
 ) -> FirstLoginOut:
     from app.accounts.first_login_service import run_account_first_login
 
@@ -57,4 +70,10 @@ def run_autonomous_instagram_login(
         else:
             ping("Почта", "буду читать код подтверждения через IMAP")
     ping("Запускаю автовход (браузер и API)")
-    return run_account_first_login(account, db, surface=surface, on_status=on_status)
+    return run_account_first_login(
+        account,
+        db,
+        surface=surface,
+        on_status=on_status,
+        submitting_code=submitting_code,
+    )

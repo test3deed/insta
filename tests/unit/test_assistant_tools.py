@@ -597,11 +597,12 @@ def test_create_accounts_two_usernames(db_session):
     from sqlalchemy import select
 
     create_proxy(db_session, label="mob-bulk", url="http://u:p@example:8000", skip_health_check=True)
+    create_proxy(db_session, label="mob-bulk-b", url="http://u:p@example:8001", skip_health_check=True)
     out = create_accounts(
         db_session,
         [
             {"username": "ann", "proxy_label": "mob-bulk", "password": "p1"},
-            {"username": "bob", "proxy_label": "mob-bulk", "password": "p2"},
+            {"username": "bob", "proxy_label": "mob-bulk-b", "password": "p2"},
         ],
     )
     assert out["failed"] == []

@@ -2470,6 +2470,7 @@ def login_account(
         db,
         surface=login_surface,
         on_status=_emit_login_status,
+        submitting_code=bool((verification_code or "").strip()),
     )
     return _login_result_payload(account, out)
 
@@ -2611,6 +2612,7 @@ def login_instagram(
         db,
         surface=login_surface,
         on_status=_emit_login_status,
+        submitting_code=bool((verification_code or "").strip()),
     )
     return _login_result_payload(account, out)
 
@@ -3469,6 +3471,12 @@ def attach_proxy(
 
     account = _account(db, account_id)
     proxy = _proxy_by_label(db, proxy_label)
+    from app.accounts.login_guard import ProxyOccupied, ensure_proxy_exclusive
+
+    try:
+        ensure_proxy_exclusive(db, proxy.id, account)
+    except ProxyOccupied as exc:
+        raise ToolError(str(exc)) from exc
     account.proxy_id = proxy.id
     account.timezone = timezone_from_proxy(proxy.timezone, proxy.country)
     db.commit()
@@ -3701,6 +3709,12 @@ def update_account(
         account.backup_codes = backup_codes.strip() or None
     if proxy_label:
         proxy = _proxy_by_label(db, proxy_label)
+        from app.accounts.login_guard import ProxyOccupied, ensure_proxy_exclusive
+
+        try:
+            ensure_proxy_exclusive(db, proxy.id, account)
+        except ProxyOccupied as exc:
+            raise ToolError(str(exc)) from exc
         account.proxy_id = proxy.id
     if daily_post_cap is not None:
         account.daily_post_cap = max(1, min(int(daily_post_cap), 20))
@@ -3804,14 +3818,20 @@ def _upsert_account(
     if creating and kind.value == "instagram" and not (password or "").strip():
         raise ToolError("для Instagram нужен пароль")
     existing = db.scalar(select(Account).where(Account.username == name, Account.platform == kind))
+    from app.accounts.login_guard import ProxyOccupied, ensure_proxy_exclusive
+
     if existing is None:
+        taken = db.scalar(select(Account).where(Account.proxy_id == proxy.id))
+        if taken is not None:
+            raise ToolError(f"Прокси уже занят аккаунтом @{taken.username}")
         account = Account(username=name, platform=kind)
         db.add(account)
     else:
-        if creating:
-            account = existing
-        else:
-            account = existing
+        try:
+            ensure_proxy_exclusive(db, proxy.id, existing)
+        except ProxyOccupied as exc:
+            raise ToolError(str(exc)) from exc
+        account = existing
     account.platform = kind
     account.password = password or account.password
     account.proxy_id = proxy.id

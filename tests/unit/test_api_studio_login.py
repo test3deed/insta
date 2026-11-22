@@ -41,13 +41,18 @@ def test_first_login_youtube_routes_studio(
         lambda: True,
     )
 
-    def _studio(account, db, *, on_status=None):
+    def _studio(account, db, *, on_status=None, collector=None, **kwargs):
         return FirstLoginOut(run_id=5, ok=True, session_imported=True, logs=[])
 
     monkeypatch.setattr("app.accounts.studio_login_service.run_studio_login", _studio)
     res = api_client.post("/api/accounts/ytapi/first-login")
     assert res.status_code == 200
     body = res.json()
+    if body["pending"]:
+        for _ in range(50):
+            body = api_client.get("/api/accounts/ytapi/first-login/current").json()
+            if not body["pending"]:
+                break
     assert body["ok"] is True
     assert body["run_id"] == 5
 

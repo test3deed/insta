@@ -19,6 +19,7 @@ from __future__ import annotations
 import random
 import re
 import signal
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -244,6 +245,11 @@ def _account_proxy(db: Session, account: Account) -> Optional[Proxy]:
     return db.get(Proxy, account.proxy_id)
 
 
+def _session_rotation_allowed(account: Account) -> bool:
+    """Client session ids stay put while a login pause or challenge is open."""
+    return account.status not in (AccountStatus.challenge, AccountStatus.cooldown)
+
+
 def _account_platform(account: Account) -> Platform:
     value = getattr(account, "platform", None)
     if isinstance(value, Platform):
@@ -451,16 +457,17 @@ def _process_job(db: Session, job: PostJob) -> None:
             country=proxy.country or "US",
             timezone_id=timezone_from_proxy(proxy.timezone, proxy.country),
         )
-        rotated, fingerprint = maybe_rotate_session_uuids(
-            account.username, fingerprint, account.last_session_rotation_at
-        )
-        if rotated:
-            account.last_session_rotation_at = datetime.now(timezone.utc)
-            db.commit()
-            diag.info("session", "Обновлены UUID клиентской сессии")
-        elif account.last_session_rotation_at is None:
-            account.last_session_rotation_at = datetime.now(timezone.utc)
-            db.commit()
+        if _session_rotation_allowed(account):
+            rotated, fingerprint = maybe_rotate_session_uuids(
+                account.username, fingerprint, account.last_session_rotation_at
+            )
+            if rotated:
+                account.last_session_rotation_at = datetime.now(timezone.utc)
+                db.commit()
+                diag.info("session", "Обновлены UUID клиентской сессии")
+            elif account.last_session_rotation_at is None:
+                account.last_session_rotation_at = datetime.now(timezone.utc)
+                db.commit()
 
     src = Path(job.source_video_path)
     if not src.exists():
@@ -760,74 +767,101 @@ def _redact_proxy(text: str) -> str:
     return re.sub(r"URL\('[^']*'\)", "URL('…')", text)
 
 
+def _has_queued_post(db: Session) -> bool:
+    waiting = db.scalar(select(PostJob.id).where(PostJob.status == PostJobStatus.queued).limit(1))
+    return waiting is not None
+
+
+def _sleep_poll() -> None:
+    sleep_for = jitter_seconds(settings.worker_poll_interval_sec, spread=0.3)
+    end = time.monotonic() + sleep_for
+    while time.monotonic() < end:
+        if _SHUTDOWN:
+            break
+        time.sleep(0.5)
+
+
+def run_publish_once(now: datetime | None = None) -> None:
+    """Claim and publish one post. Warmup runs only when the post queue is empty."""
+    now = now or datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        beat(db, period_seconds=float(settings.worker_poll_interval_sec), note="idle")
+        post_after = now - timedelta(minutes=30)
+        reclaim_stale_running(
+            db,
+            PostJob,
+            running=PostJobStatus.running,
+            queued=PostJobStatus.queued,
+            older_than=post_after,
+            now=now,
+        )
+        job = _claim_due_job(db, now)
+        if job is not None:
+            _process_job(db, job)
+            return
+        try:
+            _maybe_sync_publication_stats(now)
+        except Exception as exc:  # noqa: BLE001 - stats sync is best effort
+            logger.warning("worker.publication_stats_sync_failed", error=str(exc))
+        if _has_queued_post(db):
+            return
+        try:
+            maybe_run_idle_warmup()
+        except Exception as exc:  # noqa: BLE001 - never crash the loop
+            logger.warning("worker.idle_warmup_failed", error=_redact_proxy(str(exc)))
+
+
+def run_factory_once(now: datetime | None = None) -> None:
+    """Plan, generate, or compose one job. Independent of the publish loop."""
+    now = now or datetime.now(timezone.utc)
+    with SessionLocal() as db:
+        stale_after = now - timedelta(
+            seconds=max(float(settings.generation_timeout_seconds) * 2, 1800)
+        )
+        for model in (GenerationJob, Composition, PlanJob):
+            reclaim_stale_running(
+                db,
+                model,
+                running=PipelineStatus.running,
+                queued=PipelineStatus.queued,
+                older_than=stale_after,
+                now=now,
+            )
+        plan_job = claim_due_plan_job(db, now=now)
+        if plan_job is not None:
+            run_plan_job(db, plan_job)
+            return
+        gen_job = claim_due_generation_job(db, now=now)
+        if gen_job is not None:
+            run_generation_job(db, gen_job)
+            return
+        composition = claim_due_composition(db, now=now)
+        if composition is not None:
+            run_composition(db, composition)
+
+
+def _factory_loop() -> None:
+    while not _SHUTDOWN:
+        try:
+            run_factory_once()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("worker.factory_error", error=str(exc))
+        _sleep_poll()
+
+
 def run() -> None:
     configure_logging()
     init_db()
     _install_signals()
 
     logger.info("worker.start", poll_sec=settings.worker_poll_interval_sec)
+    threading.Thread(target=_factory_loop, name="factory-worker", daemon=True).start()
 
     while not _SHUTDOWN:
-        now = datetime.now(timezone.utc)
         try:
-            with SessionLocal() as db:
-                beat(db, period_seconds=float(settings.worker_poll_interval_sec), note="idle")
-                stale_after = now - timedelta(
-                    seconds=max(float(settings.generation_timeout_seconds) * 2, 1800)
-                )
-                post_after = now - timedelta(minutes=30)
-                for model in (GenerationJob, Composition, PlanJob):
-                    reclaim_stale_running(
-                        db,
-                        model,
-                        running=PipelineStatus.running,
-                        queued=PipelineStatus.queued,
-                        older_than=stale_after,
-                        now=now,
-                    )
-                reclaim_stale_running(
-                    db,
-                    PostJob,
-                    running=PostJobStatus.running,
-                    queued=PostJobStatus.queued,
-                    older_than=post_after,
-                    now=now,
-                )
-                plan_job = claim_due_plan_job(db, now=now)
-                if plan_job is not None:
-                    run_plan_job(db, plan_job)
-                    continue
-                gen_job = claim_due_generation_job(db, now=now)
-                if gen_job is not None:
-                    run_generation_job(db, gen_job)
-                    continue
-                composition = claim_due_composition(db, now=now)
-                if composition is not None:
-                    run_composition(db, composition)
-                    continue
-                job = _claim_due_job(db, now)
-                if job is not None:
-                    _process_job(db, job)
-                else:
-                    try:
-                        _maybe_sync_publication_stats(now)
-                    except Exception as exc:  # noqa: BLE001 - stats sync is best effort
-                        logger.warning("worker.publication_stats_sync_failed", error=str(exc))
-                    # Idle tick: with low probability, pick an inactive account
-                    # and run a publish-less warmup so its traffic profile
-                    # doesn't look like "online only when posting".
-                    try:
-                        maybe_run_idle_warmup()
-                    except Exception as exc:  # noqa: BLE001 - never crash the loop
-                        logger.warning("worker.idle_warmup_failed", error=_redact_proxy(str(exc)))
+            run_publish_once()
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("worker.loop_error", error=str(exc))
-
-        sleep_for = jitter_seconds(settings.worker_poll_interval_sec, spread=0.3)
-        end = time.monotonic() + sleep_for
-        while time.monotonic() < end:
-            if _SHUTDOWN:
-                break
-            time.sleep(0.5)
+        _sleep_poll()
 
     logger.info("worker.stopped")

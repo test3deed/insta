@@ -276,6 +276,7 @@ class AccountConnectionTestOut(BaseModel):
 class FirstLoginOut(BaseModel):
     run_id: int
     ok: bool
+    pending: bool = False
     challenge: bool = False
     browser_tab_hint: bool = False
     challenge_code_file: Optional[str] = None

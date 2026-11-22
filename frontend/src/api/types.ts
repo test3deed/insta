@@ -599,6 +599,7 @@ export interface AccountConnectionTestOut {
 export interface FirstLoginOut {
   run_id: number;
   ok: boolean;
+  pending?: boolean;
   challenge: boolean;
   browser_tab_hint?: boolean;
   challenge_code_file?: string | null;

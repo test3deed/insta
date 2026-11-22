@@ -48,6 +48,11 @@ _LIGHTWEIGHT_CHROMIUM_ARGS = [
 ]
 
 
+_PROXY_EGRESS_ARGS = [
+    "--disable-quic",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+]
+
 _STUDIO_PROXY_CHROMIUM_ARGS = [
     "--disable-quic",
 ]
@@ -72,6 +77,7 @@ def browser_launch_args(
         f"--window-size={window_size}",
         "--window-position=0,0",
         "--disable-features=IsolateOrigins,site-per-process",
+        *_PROXY_EGRESS_ARGS,
     ]
     if lightweight:
         studio_desktop = desktop_geometry is not None
@@ -92,6 +98,7 @@ def studio_vnc_launch_args(desktop_geometry: tuple[int, int] | None = None) -> l
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-quic",
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
         f"--window-size={w},{h}",
         "--window-position=0,0",
     ]

@@ -58,7 +58,21 @@ def _finish(
     browser_tab_hint: bool = False,
     session_imported: bool = False,
     error: str | None = None,
+    account: Account | None = None,
+    db: Session | None = None,
+    arm_cooldown: bool | None = None,
 ) -> FirstLoginOut:
+    if account is not None and db is not None:
+        from app.accounts.login_guard import record_login_outcome
+
+        record_login_outcome(
+            account,
+            db,
+            ok=ok,
+            challenge=challenge,
+            error=error,
+            arm_cooldown=arm_cooldown,
+        )
     collector.finish(status, summary)
     return FirstLoginOut(
         run_id=collector.run_id,
@@ -175,6 +189,7 @@ def _run_vnc_fallback(
             challenge=True,
             browser_tab_hint=True,
             error=str(exc),
+            arm_cooldown=False,
         )
 
     if ok:
@@ -187,6 +202,8 @@ def _run_vnc_fallback(
             summary=ladder.summary_ok() if ladder is not None else "Studio-сессия сохранена",
             status="ok",
             session_imported=True,
+            account=account,
+            db=db,
         )
     if ladder is not None:
         ladder.fail(METHOD_VNC, error=err or "challenge")
@@ -198,6 +215,9 @@ def _run_vnc_fallback(
         challenge=challenge,
         browser_tab_hint=True,
         error=err,
+        account=account,
+        db=db,
+        arm_cooldown=bool(challenge),
     )
 
 
@@ -207,12 +227,15 @@ def run_studio_login(
     *,
     on_status: StatusCallback | None = None,
     allow_vnc_fallback: bool = True,
+    submitting_code: bool = False,
+    collector: DiagnosticCollector | None = None,
 ) -> FirstLoginOut:
-    collector = DiagnosticCollector(
-        db,
-        kind=DiagnosticRunKind.studio_login,
-        account_id=account.id,
-    )
+    if collector is None:
+        collector = DiagnosticCollector(
+            db,
+            kind=DiagnosticRunKind.studio_login,
+            account_id=account.id,
+        )
     ladder = ConnectionLadder(collector)
     platform = _platform_value(account)
     if platform not in ("youtube", "tiktok"):
@@ -260,6 +283,27 @@ def run_studio_login(
             summary=ladder.summary_ok(),
             status="ok",
             session_imported=True,
+            account=account,
+            db=db,
+        )
+
+    from app.accounts.login_guard import assert_login_allowed
+
+    allowance = assert_login_allowed(
+        db,
+        account,
+        proxy,
+        submitting_code=submitting_code,
+    )
+    if not allowance.allowed:
+        collector.error("login", allowance.error)
+        return _finish(
+            collector,
+            ok=False,
+            summary=allowance.error,
+            status="fail",
+            error=allowance.error,
+            arm_cooldown=False,
         )
 
     log_account_credentials(collector, account, proxy)
@@ -303,6 +347,8 @@ def run_studio_login(
             summary=ladder.summary_ok(),
             status="ok",
             session_imported=True,
+            account=account,
+            db=db,
         )
 
     if result.challenge or not result.ok:
@@ -324,6 +370,9 @@ def run_studio_login(
                 challenge=bool(result.challenge or not result.ok),
                 browser_tab_hint=True,
                 error=result.error,
+                account=account,
+                db=db,
+                arm_cooldown=bool(result.challenge),
             )
         if on_status:
             on_status("Challenge", "перехожу на интерактивный браузер")
@@ -339,6 +388,9 @@ def run_studio_login(
         summary=ladder.summary_fail(result.error),
         status="fail",
         error=result.error,
+        account=account,
+        db=db,
+        arm_cooldown=False,
     )
 
 

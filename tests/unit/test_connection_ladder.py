@@ -53,12 +53,12 @@ def test_ladder_summary_after_fallback():
     assert ladder.summary_ok() == "удалось на mobile_api после playwright"
 
 
-def test_ig_playwright_fail_api_ok_skips_mint(
+def test_ig_playwright_fail_does_not_call_api_or_mint(
     db_session, make_account, make_proxy, monkeypatch
 ):
     proxy = make_proxy(label="px-ladder-api")
     account = make_account(username="ladderapi", proxy=proxy)
-    mint_calls = {"n": 0}
+    calls = {"api": 0, "mint": 0}
 
     monkeypatch.setattr(
         "app.accounts.first_login_service.playwright_browsers_available",
@@ -68,74 +68,26 @@ def test_ig_playwright_fail_api_ok_skips_mint(
         "app.accounts.first_login_service.first_login",
         lambda **kwargs: FirstLoginResult(ok=False, error="browser miss"),
     )
-    monkeypatch.setattr(
-        "app.accounts.first_login_service.login_and_export_sessionid",
-        lambda *a, **k: "a" * 40,
-    )
+
+    def _api(*a, **k):
+        calls["api"] += 1
+        return "a" * 40
 
     def _mint(*a, **k):
-        mint_calls["n"] += 1
-        raise AssertionError("mint must not run when API succeeds")
+        calls["mint"] += 1
+        raise AssertionError("mint must not run after a browser miss")
 
-    monkeypatch.setattr(
-        "app.accounts.mint_mobile_session.mint_mobile_session_into",
-        _mint,
-    )
+    monkeypatch.setattr("app.accounts.first_login_service.login_and_export_sessionid", _api)
+    monkeypatch.setattr("app.accounts.mint_mobile_session.mint_mobile_session_into", _mint)
 
     out = run_account_first_login(account, db_session)
-    assert out.ok is True
-    assert mint_calls["n"] == 0
+    assert out.ok is False
+    assert out.error == "browser miss"
+    assert calls == {"api": 0, "mint": 0}
     attempts = [line for line in out.logs if line.step == "attempt"]
     assert any("method=playwright" in line.message and "status=fail" in line.message for line in attempts)
-    assert any("method=mobile_api" in line.message and "status=ok" in line.message for line in attempts)
-    assert not any("method=mint_mobile" in line.message and "status=started" in line.message for line in attempts)
-
-
-def test_ig_playwright_and_api_fail_calls_mint(
-    db_session, make_account, make_proxy, monkeypatch
-):
-    from app.accounts.mint_mobile_session import MintCoreResult
-    from app.accounts.session_manager import AuthenticationError
-
-    proxy = make_proxy(label="px-ladder-mint")
-    account = make_account(username="laddermint", proxy=proxy)
-    mint_calls = {"n": 0}
-
-    monkeypatch.setattr(
-        "app.accounts.first_login_service.playwright_browsers_available",
-        lambda: True,
-    )
-    monkeypatch.setattr(
-        "app.accounts.first_login_service.first_login",
-        lambda **kwargs: FirstLoginResult(ok=False, error="browser miss"),
-    )
-    monkeypatch.setattr(
-        "app.accounts.first_login_service.login_and_export_sessionid",
-        lambda *a, **k: (_ for _ in ()).throw(AuthenticationError("rate-limited")),
-    )
-
-    def _mint(collector, account, db, **kwargs):
-        mint_calls["n"] += 1
-        account.session_id = "m" * 40
-        db.commit()
-        return MintCoreResult(ok=True, session_id="m" * 40)
-
-    monkeypatch.setattr(
-        "app.accounts.mint_mobile_session.mint_mobile_session_into",
-        _mint,
-    )
-
-    out = run_account_first_login(account, db_session)
-    assert out.ok is True
-    assert mint_calls["n"] == 1
-    assert any(
-        line.step == "attempt"
-        and "method=mint_mobile" in line.message
-        and "status=ok" in line.message
-        for line in out.logs
-    )
-    db_session.refresh(account)
-    assert account.session_id == "m" * 40
+    assert not any("method=mobile_api" in line.message for line in attempts)
+    assert not any("method=mint_mobile" in line.message for line in attempts)
 
 
 def test_studio_headless_fail_calls_vnc(

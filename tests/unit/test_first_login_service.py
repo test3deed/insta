@@ -1,5 +1,5 @@
 """Tests for first-login API service."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.accounts.first_login_service import run_account_first_login
 from app.api.schemas import (
@@ -241,7 +241,7 @@ def test_first_login_service_keeps_explicit_account_timezone(
     assert account.timezone == "Europe/Moscow"
 
 
-def test_first_login_service_api_fallback_after_playwright_fail(
+def test_first_login_service_stops_after_playwright_fail(
     db_session, make_account, make_proxy, monkeypatch
 ):
     proxy = make_proxy(label="px-api")
@@ -259,15 +259,19 @@ def test_first_login_service_api_fallback_after_playwright_fail(
             cookie_names=("csrftoken",),
         ),
     )
-    monkeypatch.setattr(
-        "app.accounts.first_login_service.login_and_export_sessionid",
-        lambda *args, **kwargs: "f" * 40,
-    )
+    calls = {"n": 0}
+
+    def _api(*args, **kwargs):
+        calls["n"] += 1
+        return "f" * 40
+
+    monkeypatch.setattr("app.accounts.first_login_service.login_and_export_sessionid", _api)
     out = run_account_first_login(account, db_session)
-    assert out.ok is True
-    assert out.session_imported is True
+    assert out.ok is False
+    assert calls["n"] == 0
+    assert "sessionid" in (out.error or "")
     db_session.refresh(account)
-    assert account.session_id == "f" * 40
+    assert not account.session_id
 
 
 def test_first_login_service_bad_password_message(
@@ -305,7 +309,7 @@ def test_first_login_service_bad_password_message(
 
     out = run_account_first_login(account, db_session)
     assert out.ok is False
-    assert "Неверный пароль" in (out.error or "")
+    assert out.error == "Браузер остался на странице логина"
     assert out.login_debug_available is True
     account_logs = [line.message for line in out.logs if line.step == "account"]
     assert any("Пароль:" in m for m in account_logs)
@@ -316,7 +320,7 @@ def test_first_login_service_bad_password_message(
     assert len(events) == 1
     assert events[0].kind == "first_login"
     assert events[0].level == EventLevel.error
-    assert events[0].message and "Неверный пароль" in events[0].message
+    assert events[0].message and "Браузер остался на странице логина" in events[0].message
     assert "hunter" not in events[0].message.lower()
 
 
@@ -358,7 +362,7 @@ def test_first_login_service_guest_explore_error_and_bad_password(
 
     out = run_account_first_login(account, db_session)
     assert out.ok is False
-    assert out.error == "Неверный пароль — обновите пароль аккаунта в панели"
+    assert "гостевой Explore" in (out.error or "")
     login_msgs = [line.message for line in out.logs if line.step == "login"]
     assert any("гостевой Explore" in m for m in login_msgs)
 
@@ -405,10 +409,9 @@ def test_first_login_service_account_not_found_retries_email(
         _fake_api_login,
     )
     out = run_account_first_login(account, db_session)
-    assert out.ok is True
-    assert calls == ["geuser", "real@example.com"]
-    db_session.refresh(account)
-    assert account.session_id == "a" * 40
+    assert out.ok is False
+    assert calls == []
+    assert out.error == "no sessionid"
 
 
 def test_first_login_service_passes_login_identifier_to_playwright(
@@ -518,6 +521,8 @@ def test_first_login_uses_attached_proxy_url(db_session, make_account, make_prox
 
     attach_proxy(db_session, account.id, "px-chain-b")
     db_session.refresh(account)
+    account.last_login_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+    db_session.commit()
     out_b = run_account_first_login(account, db_session)
     assert out_b.ok is True
     assert captured["proxy_url"] == proxy_b.url
