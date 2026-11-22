@@ -76,6 +76,21 @@ def test_create_video_posts_payload(mock_client_factory):
     assert payload["duration"] == "5s"
 
 
+@patch("app.services.qubax.http_client")
+def test_create_video_prefers_generation_id(mock_client_factory):
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"id": "request-1", "generation_id": "gen-9", "status": "pending"}
+    mock_client.post.return_value = mock_response
+    mock_client.__enter__ = MagicMock(return_value=mock_client)
+    mock_client.__exit__ = MagicMock(return_value=False)
+    mock_client_factory.return_value = mock_client
+
+    body = qx.create_video("key", model="video-gen", prompt="test")
+    assert body["id"] == "gen-9"
+
+
 @pytest.fixture()
 def auth_client(app_env, monkeypatch):
     from app.api import deps as api_deps
@@ -253,6 +268,20 @@ def test_billing_balance_usd_and_micros():
 def test_extract_video_url_nested():
     body = {"status": "completed", "output": {"video_url": "https://cdn.example/v.mp4"}}
     assert qx.extract_video_url(body) == "https://cdn.example/v.mp4"
+
+
+def test_normalize_job_reads_artifact_and_succeeded():
+    body = qx.normalize_job(
+        {
+            "id": "request-1",
+            "generation_id": "gen-9",
+            "status": "succeeded",
+            "result": {"artifacts": [{"url": "https://cdn.example/done.mp4"}]},
+        }
+    )
+    assert body["id"] == "gen-9"
+    assert body["status"] == "completed"
+    assert body["video_url"] == "https://cdn.example/done.mp4"
 
 
 def test_raise_http_402():

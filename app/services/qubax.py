@@ -49,7 +49,27 @@ def extract_video_url(body: dict[str, Any]) -> str | None:
             url = nested.get("video_url") or nested.get("url")
             if url:
                 return str(url)
+            artifacts = nested.get("artifacts")
+            if isinstance(artifacts, list):
+                for item in artifacts:
+                    if isinstance(item, dict) and item.get("url"):
+                        return str(item["url"])
     return None
+
+
+def normalize_job(body: dict[str, Any]) -> dict[str, Any]:
+    """Use the id Qubax polls, and surface a finished clip as completed + video_url."""
+    generation_id = body.get("generation_id")
+    if generation_id not in (None, ""):
+        body["id"] = str(generation_id)
+    elif body.get("id") not in (None, ""):
+        body["id"] = str(body["id"])
+    if str(body.get("status") or "").lower() == "succeeded":
+        body["status"] = "completed"
+    url = extract_video_url(body)
+    if url and not body.get("video_url"):
+        body["video_url"] = url
+    return body
 
 
 _VIDEO_ID_HINTS = (
@@ -452,10 +472,9 @@ def create_video(
     body = response.json()
     if not isinstance(body, dict):
         raise QubaxError("Qubax вернул пустой ответ на submit")
-    job_id = body.get("id")
-    if job_id is None or job_id == "":
+    normalize_job(body)
+    if body.get("id") in (None, ""):
         raise QubaxError("Qubax не вернул id задачи")
-    body["id"] = str(job_id)
     return body
 
 
@@ -466,7 +485,7 @@ def get_video_job(api_key: str, external_id: str) -> dict[str, Any]:
     body = response.json()
     if not isinstance(body, dict):
         raise QubaxError("Qubax вернул некорректный статус")
-    return body
+    return normalize_job(body)
 
 
 def poll_video_job(
