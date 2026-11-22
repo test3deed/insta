@@ -27,6 +27,15 @@ import { usePollWhenVisible } from "../hooks/usePollWhenVisible";
 import { useToast } from "../context/ToastContext";
 import { EmptyState } from "./EmptyState";
 
+function qubaxHosted(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "api.qubax.ai" || host.endsWith(".qubax.ai");
+  } catch {
+    return false;
+  }
+}
+
 function QubaxJobPlayer({
   job,
   onPhase,
@@ -35,7 +44,8 @@ function QubaxJobPlayer({
   onPhase?: (phase: "idle" | "loading" | "ready") => void;
 }) {
   const remote = job.video_url || "";
-  const [src, setSrc] = useState(remote);
+  const gated = qubaxHosted(remote);
+  const [src, setSrc] = useState(gated && !job.media_filename ? "" : remote);
 
   useEffect(() => {
     if (job.status !== "completed") {
@@ -43,8 +53,8 @@ function QubaxJobPlayer({
       return;
     }
     if (!job.media_filename) {
-      setSrc(remote);
-      onPhase?.("idle");
+      setSrc(gated ? "" : remote);
+      onPhase?.(gated ? "loading" : "idle");
       return;
     }
     let cancelled = false;
@@ -60,7 +70,7 @@ function QubaxJobPlayer({
       })
       .catch(() => {
         if (!cancelled) {
-          setSrc(remote);
+          setSrc(gated ? "" : remote);
           onPhase?.("ready");
         }
       });
@@ -68,8 +78,11 @@ function QubaxJobPlayer({
       cancelled = true;
       revokeMediaObjectUrl(objectUrl);
     };
-  }, [job.media_filename, job.status, onPhase, remote]);
+  }, [gated, job.media_filename, job.status, onPhase, remote]);
 
+  if (job.status === "completed" && gated && !src) {
+    return <p className="mb-2 text-xs text-slate-400">Файл ещё сохраняется</p>;
+  }
   if (job.status !== "completed" || !src) return null;
   return (
     <video

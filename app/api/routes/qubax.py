@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -154,6 +155,11 @@ def _needs_remote_refresh(row: QubaxVideoJob) -> bool:
     return not qx.is_terminal_status(row.status)
 
 
+def _qubax_media_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "api.qubax.ai" or host.endswith(".qubax.ai")
+
+
 def _download_into_library(db: Session, row: QubaxVideoJob) -> MediaAsset:
     if row.media_asset_id is not None:
         existing = db.get(MediaAsset, row.media_asset_id)
@@ -164,7 +170,12 @@ def _download_into_library(db: Session, row: QubaxVideoJob) -> MediaAsset:
     final_name = f"{uuid.uuid4().hex}.mp4"
     dest = settings.media_dir / final_name
     settings.media_dir.mkdir(parents=True, exist_ok=True)
-    with http_client(settings, timeout=300) as client:
+    headers = None
+    if _qubax_media_host(row.video_url):
+        key = resolve_qubax_api_key(db)
+        if key:
+            headers = {"Authorization": f"Bearer {key}"}
+    with http_client(settings, timeout=300, headers=headers) as client:
         download_url(client, row.video_url, dest, name="qubax")
     probe = probe_video(dest)
     params = _params_dict(row.params_json)

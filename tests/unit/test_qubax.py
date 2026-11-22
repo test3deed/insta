@@ -491,6 +491,36 @@ def test_completed_job_is_saved_and_listed_as_render(
     assert qubax_again[0]["id"] == qubax_rows[0]["id"]
 
 
+@patch("app.api.routes.qubax.probe_video")
+@patch("app.api.routes.qubax.download_url")
+@patch("app.api.routes.qubax.http_client")
+def test_studio_media_download_sends_the_api_key(mock_http, _download, mock_probe, auth_client, app_env):
+    from app.db.models import QubaxVideoJob
+    from app.services.media import Probe
+
+    db = app_env.SessionLocal()
+    row = QubaxVideoJob(
+        external_id="gen-1",
+        model="kling-v3-standard-text-to-video",
+        prompt="ridge",
+        status="completed",
+        video_url="https://api.qubax.ai/studio/media/job/0",
+    )
+    db.add(row)
+    db.commit()
+    db.close()
+
+    mock_probe.return_value = Probe(duration_s=5, width=720, height=1280)
+    client = MagicMock()
+    mock_http.return_value.__enter__.return_value = client
+    mock_http.return_value.__exit__.return_value = False
+
+    response = auth_client.get("/api/qubax/jobs?sync_active=true", headers=_h())
+    assert response.status_code == 200
+    assert response.json()["items"][0]["media_filename"].endswith(".mp4")
+    assert mock_http.call_args.kwargs["headers"]["Authorization"] == "Bearer qbx_test_key"
+
+
 def test_worker_keeps_polling_until_a_missing_generation_appears():
     from app.config import get_settings
     from app.generation.qubax import QubaxVideoBackend

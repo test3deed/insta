@@ -280,6 +280,36 @@ describe("QubaxPanel", () => {
     expect(card.querySelector("video")).toHaveAttribute("src", "https://cdn.example/v.mp4");
   });
 
+  it("does not point the player at a locked Qubax media url", async () => {
+    apiMock.qubax.status.mockResolvedValue({
+      configured: true,
+      key_from_env: false,
+      balance: 1,
+    });
+    apiMock.qubax.models.mockResolvedValue({ presets: [], models: [] });
+    apiMock.qubax.listJobs.mockResolvedValue({
+      items: [
+        {
+          id: 8,
+          external_id: "ext",
+          model: "kling-v3-standard-text-to-video",
+          prompt: "ridge",
+          status: "completed",
+          video_url: "https://api.qubax.ai/studio/media/job/0",
+        },
+      ],
+      total: 1,
+    });
+    render(
+      <MemoryRouter>
+        <QubaxPanel />
+      </MemoryRouter>
+    );
+    const card = await screen.findByTestId("qubax-job-8");
+    expect(card.querySelector("video")).toBeNull();
+    expect(screen.getByText("Файл ещё сохраняется")).toBeInTheDocument();
+  });
+
   it("apply suggested public url fills input", async () => {
     apiMock.qubax.status.mockResolvedValue({
       configured: true,
