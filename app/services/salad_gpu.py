@@ -279,8 +279,22 @@ def _salad_wan_enabled(settings: Settings) -> bool:
     return bool((settings.wan_base_url or "").strip())
 
 
+def _model_export(model: str) -> str:
+    return f"export AGENT_MODEL={model}"
+
+
+def _missing_model_export(settings: Settings, text: str) -> bool:
+    """start.sh pulls whatever AGENT_MODEL the container has, not the panel's."""
+    if "/opt/gpu/start.sh" not in text:
+        return False
+    return _model_export(_model_name(settings)) not in text
+
+
 def _warmup_command_stale(settings: Settings, text: str) -> bool:
     # A hand-written image entry already starts the container. Replacing it restarts the replica.
+    # Still replace it once when it would pull a different model than AGENT_MODEL.
+    if _missing_model_export(settings, text):
+        return True
     if "/opt/gpu/start.sh" in text:
         return False
     if WARMUP_MARKER not in text or IPV6_MARKER not in text:
@@ -376,6 +390,7 @@ def warmup_script(model: str, settings: Settings | None = None) -> str:
         "fi\n"
         f"{install}"
         f"{_wan_sdpa_shell() if wan else ''}"
+        f"{_model_export(model)}\n"
         "/opt/gpu/start.sh &\n"
         "spid=$!\n"
         f"{warm_loop}"
@@ -495,8 +510,8 @@ def _model_loaded(origin: str, settings: Settings, model: str) -> bool:
     return any(_model_name_matches(name, model) for name in _models_in_payload(payload))
 
 
-def _model_present(origin: str, settings: Settings, model: str) -> bool | None:
-    """True/False when /api/tags answers; None when tags is unreachable."""
+def _installed_models(origin: str, settings: Settings) -> list[str] | None:
+    """Names from /api/tags, or None when tags is unreachable."""
     response = _get(origin, "/api/tags", settings)
     if response is None or response.status_code >= 400:
         return None
@@ -504,7 +519,41 @@ def _model_present(origin: str, settings: Settings, model: str) -> bool | None:
         payload = response.json()
     except ValueError:
         return None
-    return any(_model_name_matches(name, model) for name in _models_in_payload(payload))
+    return _models_in_payload(payload)
+
+
+def _model_present(origin: str, settings: Settings, model: str) -> bool | None:
+    """True/False when /api/tags answers; None when tags is unreachable."""
+    names = _installed_models(origin, settings)
+    if names is None:
+        return None
+    return any(_model_name_matches(name, model) for name in names)
+
+
+def _pull_failed(result: str) -> bool:
+    return result == "нет связи" or result.isdigit()
+
+
+def _missing_model_message(model: str, names: list[str]) -> str:
+    listed = ", ".join(names) if names else "пусто"
+    return (
+        f"Модели {model} нет на узле — проверьте образ GPU / AGENT_MODEL. На узле: {listed}"
+    )
+
+
+def _pull_model(origin: str, settings: Settings, model: str) -> str:
+    """Ask Ollama to download the model. A timeout can still leave the pull running."""
+    body = {"model": model, "stream": False}
+    try:
+        with http_client(settings, timeout=KICK_TIMEOUT_S) as client:
+            response = client.post(f"{origin}/api/pull", json=body)
+    except httpx.TimeoutException:
+        return "timeout, докачка могла начаться"
+    except httpx.RequestError:
+        return "нет связи"
+    if response.status_code >= 400:
+        return str(response.status_code)
+    return "200, pull"
 
 
 def _kick_model_load(origin: str, settings: Settings, model: str) -> str:
@@ -905,9 +954,12 @@ def prepare_for_chat(
         raise SaladProblem(exhausted)
 
     state = yield from fetch_group()
-    # Patch only a stopped group. A live or starting replica is replaced by Salad
-    # and the image plus the model are downloaded again.
-    if needs_gateway_patch(settings, state) and state.status in START_READY:
+    # Patch a stopped group, or a running one whose command would pull the wrong model.
+    # A live replica is replaced once so start.sh downloads AGENT_MODEL before nginx.
+    export_missing = _missing_model_export(settings, _command_text(state))
+    if needs_gateway_patch(settings, state) and (
+        state.status in START_READY or (state.status == "running" and export_missing)
+    ):
         yield emit(PHASE_PATCH, 1, soft_s=60, force_milestone=True)
         known = state
         state = yield from call_action(lambda: patch_gateway(settings, known))
@@ -1004,6 +1056,7 @@ def prepare_for_chat(
     model = _model_name(settings)
     deadline = clock() + START_WAIT_S + WARM_WAIT_S
     last_kick = 0.0
+    pulled = False
     while True:
         up = _ollama_up(origin, settings)
         loaded = _model_loaded(origin, settings, model) if up else False
@@ -1015,25 +1068,39 @@ def prepare_for_chat(
             yield traced
         if up and loaded:
             break
-        if clock() > deadline:
-            raise SaladProblem(
-                "Модель не успела прогреться" if up else "Видеокарта не успела запуститься"
-            )
         if up:
-            present = _model_present(origin, settings, model)
+            names = _installed_models(origin, settings)
+            present = (
+                None
+                if names is None
+                else any(_model_name_matches(name, model) for name in names)
+            )
             if present is False:
-                raise SaladProblem(
-                    f"Модели {model} нет на узле — проверьте образ GPU / AGENT_MODEL"
-                )
-            now = clock()
-            if last_kick == 0.0 or now - last_kick >= KICK_INTERVAL_S:
-                kick_result = _kick_model_load(origin, settings, model)
-                last_kick = now
-                kicked = wire("POST", f"{origin}/api/generate", kick_result)
-                if kicked:
-                    yield kicked
-            yield emit(PHASE_MODEL, 4, soft_s=WARM_WAIT_S)
+                if not pulled:
+                    pull_result = _pull_model(origin, settings, model)
+                    pulled = True
+                    pulled_trace = wire("POST", f"{origin}/api/pull", pull_result)
+                    if pulled_trace:
+                        yield pulled_trace
+                    if _pull_failed(pull_result):
+                        raise SaladProblem(_missing_model_message(model, names or []))
+                elif clock() > deadline:
+                    raise SaladProblem(_missing_model_message(model, names or []))
+                yield emit(PHASE_MODEL, 4, soft_s=WARM_WAIT_S)
+            else:
+                if clock() > deadline:
+                    raise SaladProblem("Модель не успела прогреться")
+                now = clock()
+                if last_kick == 0.0 or now - last_kick >= KICK_INTERVAL_S:
+                    kick_result = _kick_model_load(origin, settings, model)
+                    last_kick = now
+                    kicked = wire("POST", f"{origin}/api/generate", kick_result)
+                    if kicked:
+                        yield kicked
+                yield emit(PHASE_MODEL, 4, soft_s=WARM_WAIT_S)
         else:
+            if clock() > deadline:
+                raise SaladProblem("Видеокарта не успела запуститься")
             yield emit(PHASE_OLLAMA, 3, soft_s=START_WAIT_S, extra=state.status or "")
         pause(POLL_S)
         state = yield from fetch_group()

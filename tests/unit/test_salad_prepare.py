@@ -30,6 +30,7 @@ _READY = (
     "gpu-warmup",
     "gateway-ipv6",
     "ollama-only-warmup",
+    "export AGENT_MODEL=qwen3:32b",
     "/opt/gpu/start.sh",
     "wan-dashscope",
     "wan-sdpa-attn",
@@ -72,6 +73,7 @@ def test_warmup_script_ollama_only_without_wan_url(app_env, monkeypatch):
     assert "/opt/wan/wan/modules/model.py" not in script
     assert "[::]:8080" in script
     assert "qwen3:32b" in script
+    assert script.index("export AGENT_MODEL=qwen3:32b") < script.index("/opt/gpu/start.sh")
     assert "127.0.0.1:11434" in script
     assert "tee /tmp/warmup.log" in script
     assert "gpu-warmup: generate attempt" in script
@@ -399,19 +401,66 @@ def test_prepare_kicks_generate_when_model_is_on_disk_but_not_loaded(app_env, mo
     assert base == f"{ORIGIN}/v1"
 
 
-def test_prepare_fails_when_model_missing_from_tags(app_env, monkeypatch):
+def test_prepare_pulls_a_missing_model_once_and_waits(app_env, monkeypatch):
     _enable(monkeypatch)
     monkeypatch.setattr(salad_gpu, "get_group", lambda settings=None: _group("running"))
+    tags = {"n": 0}
+    ps = {"n": 0}
+
+    def tags_side_effect(request):
+        tags["n"] += 1
+        if tags["n"] < 2:
+            return httpx.Response(200, json={"models": []})
+        return httpx.Response(200, json={"models": [{"name": "qwen3:32b"}]})
+
+    def ps_side_effect(request):
+        ps["n"] += 1
+        if ps["n"] < 2:
+            return httpx.Response(200, json={"models": []})
+        return httpx.Response(200, json={"models": [{"name": "qwen3:32b"}]})
+
+    with respx.mock:
+        respx.get(f"{ORIGIN}/").mock(return_value=httpx.Response(200, text="Ollama is running"))
+        respx.get(f"{ORIGIN}/api/tags").mock(side_effect=tags_side_effect)
+        respx.get(f"{ORIGIN}/api/ps").mock(side_effect=ps_side_effect)
+        pull = respx.post(f"{ORIGIN}/api/pull").mock(return_value=httpx.Response(200, json={}))
+        gen = salad_gpu.prepare_for_chat(settings, pause=lambda _s: None)
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            base = stop.value
+    assert pull.call_count == 1
+    assert base == f"{ORIGIN}/v1"
+
+
+def test_prepare_reports_installed_models_when_the_pull_deadline_passes(app_env, monkeypatch):
+    _enable(monkeypatch)
+    monkeypatch.setattr(salad_gpu, "get_group", lambda settings=None: _group("running"))
+    clock = {"n": 0}
+
+    def tick() -> float:
+        clock["n"] += 1
+        # started, deadline, and the first status line stay at 0 so the pull is not the timeout.
+        if clock["n"] <= 3:
+            return 0.0
+        return salad_gpu.START_WAIT_S + salad_gpu.WARM_WAIT_S + 1
+
     with respx.mock:
         respx.get(f"{ORIGIN}/").mock(return_value=httpx.Response(200, text="Ollama is running"))
         respx.get(f"{ORIGIN}/api/tags").mock(
             return_value=httpx.Response(200, json={"models": [{"name": "other:7b"}]})
         )
         respx.get(f"{ORIGIN}/api/ps").mock(return_value=httpx.Response(200, json={"models": []}))
-        gen = salad_gpu.prepare_for_chat(settings, pause=lambda _s: None)
-        with pytest.raises(SaladProblem, match="нет на узле"):
+        pull = respx.post(f"{ORIGIN}/api/pull").mock(return_value=httpx.Response(200, json={}))
+        gen = salad_gpu.prepare_for_chat(settings, pause=lambda _s: None, clock=tick)
+        lines = []
+        with pytest.raises(SaladProblem, match="нет на узле") as caught:
             while True:
-                next(gen)
+                lines.append(next(gen))
+    assert pull.call_count == 1
+    assert "other:7b" in str(caught.value)
+    assert PHASE_MODEL in _titles(lines)
 
 
 def test_prepare_keeps_the_pull_clock_from_salad_start_time(app_env, monkeypatch):
@@ -867,9 +916,38 @@ def test_prepare_defers_gateway_patch_until_the_node_is_running(app_env, monkeyp
     assert base == f"{ORIGIN}/v1"
 
 
+def test_prepare_patches_a_running_group_missing_the_model_export(app_env, monkeypatch):
+    _enable(monkeypatch)
+    command = ("/bin/bash", "-c", "/opt/gpu/start.sh")
+    monkeypatch.setattr(
+        salad_gpu,
+        "get_group",
+        lambda settings=None: _group("running", command=command),
+    )
+    with respx.mock:
+        route = respx.patch(salad_gpu._group_url(settings)).mock(
+            return_value=httpx.Response(200, json={})
+        )
+        respx.get(f"{ORIGIN}/").mock(return_value=httpx.Response(200, text="Ollama is running"))
+        respx.get(f"{ORIGIN}/api/ps").mock(
+            return_value=httpx.Response(200, json={"models": [{"name": "qwen3:32b"}]})
+        )
+        gen = salad_gpu.prepare_for_chat(settings, pause=lambda _s: None)
+        try:
+            while True:
+                next(gen)
+        except StopIteration as stop:
+            base = stop.value
+    assert route.called
+    raw = route.calls[0].request.read().decode()
+    assert "export AGENT_MODEL=qwen3:32b" in raw
+    assert raw.index("export AGENT_MODEL=qwen3:32b") < raw.index("/opt/gpu/start.sh")
+    assert base == f"{ORIGIN}/v1"
+
+
 def test_prepare_does_not_patch_a_running_group_that_already_starts_the_image(app_env, monkeypatch):
     _enable(monkeypatch)
-    command = ("/bin/bash", "-c", "export AGENT_MODEL=qwen3:30b-a3b\n/opt/gpu/start.sh")
+    command = ("/bin/bash", "-c", "export AGENT_MODEL=qwen3:32b\n/opt/gpu/start.sh")
     monkeypatch.setattr(
         salad_gpu,
         "get_group",
