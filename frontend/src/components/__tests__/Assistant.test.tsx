@@ -466,11 +466,13 @@ describe("Assistant", () => {
     expect(screen.getAllByText("привет").length).toBeGreaterThan(0);
   });
 
-  it("keeps the warmup line above the reply", async () => {
+  it("keeps one reply after warmup lines", async () => {
     askMock.mockImplementation(async (_messages, onStep) => {
       onStep({ type: "status", text: "Запускаю видеокарту, подождите" });
       onStep({ type: "status", text: "Запускаю видеокарту, подождите" });
       onStep({ type: "status", text: "Прогреваю модель, подождите" });
+      onStep({ type: "token", text: "я " });
+      onStep({ type: "token", text: "здесь" });
       onStep({
         type: "done",
         reply: "я здесь",
@@ -485,9 +487,10 @@ describe("Assistant", () => {
     await user.type(await screen.findByLabelText(/спросить агента/i), "привет");
     await user.click(screen.getByRole("button", { name: /^спросить$/i }));
     expect(await screen.findByText("я здесь")).toBeInTheDocument();
-    expect(screen.getByText("Запускаю видеокарту, подождите")).toBeInTheDocument();
-    expect(screen.getByText("Прогреваю модель, подождите")).toBeInTheDocument();
-    expect(screen.getAllByText("Запускаю видеокарту, подождите")).toHaveLength(1);
+    expect(screen.getAllByText("я здесь")).toHaveLength(1);
+    expect(screen.queryByText("Запускаю видеокарту, подождите")).not.toBeInTheDocument();
+    expect(screen.queryByText("Прогреваю модель, подождите")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Скопировать ответ" })).toHaveLength(1);
   });
 
   it("keeps the shared connect bar when Salad is still deploying after an error", async () => {

@@ -117,19 +117,8 @@ export function AssistantMessageBody({ content, onCopyToast, streaming = false, 
 
   return (
     <div
-      className={clsxStreamingRoot(streaming)}
+      className="space-y-2 text-sm text-slate-100"
     >
-      {!streaming ? (
-        <button
-          type="button"
-          className="absolute -top-1 right-0 rounded-md border border-transparent p-1 text-slate-500 opacity-0 transition hover:border-slate-700 hover:bg-slate-800 hover:text-slate-200 focus:opacity-100 group-hover:opacity-100 group-focus-within:opacity-100"
-          aria-label="Скопировать ответ"
-          title="Скопировать ответ"
-          onClick={() => void copy()}
-        >
-          {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
-        </button>
-      ) : null}
       {blocks.map((block, i) =>
         block.type === "code" ? (
           <pre
@@ -157,12 +146,17 @@ export function AssistantMessageBody({ content, onCopyToast, streaming = false, 
           </span>
         </p>
       ) : null}
+      {!streaming && content.trim() ? (
+        <button
+          type="button"
+          className="mt-1 inline-flex items-center rounded-md border border-slate-700 bg-slate-900/80 p-1 text-slate-400 hover:border-slate-600 hover:text-slate-200"
+          aria-label="Скопировать ответ"
+          title="Скопировать ответ"
+          onClick={() => void copy()}
+        >
+          {copied ? <Check size={14} className="text-emerald-400" /> : <Copy size={14} />}
+        </button>
+      ) : null}
     </div>
   );
-}
-
-function clsxStreamingRoot(streaming: boolean) {
-  return streaming
-    ? "relative space-y-2 text-sm text-slate-100"
-    : "group relative space-y-2 text-sm text-slate-100";
 }

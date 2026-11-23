@@ -219,7 +219,15 @@ def _consume(
             answer = step
             _touch(job_id, reply=(step.reply or "")[:8000])
         elif isinstance(step, Step) and step.text:
-            _touch(job_id, note=str(step.text)[:500], reply=_reply_progress(job_id, step))
+            kind = getattr(step, "kind", "")
+            if kind == "status":
+                _touch(
+                    job_id,
+                    note=str(step.text)[:500],
+                    reply=_reply_progress(job_id, step),
+                )
+            elif kind == "token":
+                _touch(job_id, reply=_reply_progress(job_id, step))
     return answer
 
 

@@ -849,12 +849,6 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
               attachments: attachments.length ? attachments : undefined,
             },
           ];
-      const notes: Said[] = [];
-      const pushStatus = (line: string) => {
-        if (notes.some((item) => item.content === line)) return;
-        notes.push({ role: "assistant", content: line });
-        replaceMessages(id, [...asked, ...notes]);
-      };
       if (!isRetry) replaceMessages(id, asked);
       setDraft("");
       setDraftAttachments([]);
@@ -901,7 +895,6 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
         answered = true;
         replaceMessages(id, [
           ...asked,
-          ...notes,
           {
             role: "assistant",
             content: media ? FORMAT_LINE : printed || (kept ? "" : detail),
@@ -927,13 +920,12 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
           (step) => {
             if (controller.signal.aborted) return;
             if (step.type === "status") {
-              pushStatus(step.text);
+              patchLive(id, { progressText: step.text, progressDetail: null });
             } else if (step.type === "wire") {
               const line = `${step.text} ${step.name ?? ""} → ${step.detail ?? ""}`.trim();
               wireRef.current[id] = [...(wireRef.current[id] ?? []), line];
               patchLive(id, { wires: wireRef.current[id] });
             } else if (step.type === "progress") {
-              if (step.text) pushStatus(step.text);
               patchLive(id, {
                 progressText: step.text,
                 progressDetail: step.detail ?? null,
@@ -1023,7 +1015,6 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
                 answered = true;
                 replaceMessages(id, [
                   ...asked,
-                  ...notes,
                   {
                     role: "assistant",
                     content: detail,
@@ -1046,7 +1037,6 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
               }
               replaceMessages(id, [
                 ...asked,
-                ...notes,
                 {
                   role: "assistant",
                   content: reply,
@@ -1119,7 +1109,7 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
           if (writingRef.current[id] || (thinkRef.current[id] ?? "").trim() || (doingRef.current[id] ?? []).length) {
             keepPartial(formatApiError(err));
           } else {
-            replaceMessages(id, [...asked, ...notes, { role: "assistant", content: formatApiError(err) }]);
+            replaceMessages(id, [...asked, { role: "assistant", content: formatApiError(err) }]);
             answered = true;
           }
         }
@@ -1128,7 +1118,7 @@ export function Assistant({ onHiddenChange }: AssistantProps) {
           if (writingRef.current[id] || (thinkRef.current[id] ?? "").trim() || (doingRef.current[id] ?? []).length) {
             keepPartial("Ответа не было.");
           } else {
-            replaceMessages(id, [...asked, ...notes, { role: "assistant", content: "Ответа не было." }]);
+            replaceMessages(id, [...asked, { role: "assistant", content: "Ответа не было." }]);
           }
         }
         if (stops.current[id] === controller) delete stops.current[id];
